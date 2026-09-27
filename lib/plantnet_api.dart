@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as img;
 
 class PlantNetResult {
   final String name;
@@ -16,15 +17,46 @@ class PlantNetResult {
 }
 
 class PlantNetApi {
-  // ==========================================================
-  // IDENTIFY PLANT
-  // ==========================================================
-
   static Future<List<PlantNetResult>> identify(
     Uint8List imageBytes,
   ) async {
-    // Запит іде через наш Netlify-проксі.
-    // API-ключ Pl@ntNet більше не знаходиться у Flutter-коді.
+    Uint8List compressedBytes;
+
+    try {
+      final decodedImage = img.decodeImage(imageBytes);
+
+      if (decodedImage == null) {
+        throw Exception('Не вдалося прочитати фотографію.');
+      }
+
+      final orientedImage = img.bakeOrientation(decodedImage);
+
+      img.Image resizedImage = orientedImage;
+
+      if (orientedImage.width > 1200 || orientedImage.height > 1200) {
+        resizedImage = img.copyResize(
+          orientedImage,
+          width: orientedImage.width >= orientedImage.height
+              ? 1200
+              : null,
+          height: orientedImage.height > orientedImage.width
+              ? 1200
+              : null,
+        );
+      }
+
+      compressedBytes = Uint8List.fromList(
+        img.encodeJpg(
+          resizedImage,
+          quality: 70,
+        ),
+      );
+    } catch (e) {
+      throw Exception(
+        'Не вдалося підготувати фотографію для PlantNet.',
+      );
+    }
+
     final uri = Uri.parse('/api/plantnet');
 
     final request = http.MultipartRequest(
@@ -35,7 +67,7 @@ class PlantNetApi {
     request.files.add(
       http.MultipartFile.fromBytes(
         'image',
-        imageBytes,
+        compressedBytes,
         filename: 'tree.jpg',
       ),
     );
