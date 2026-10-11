@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -17,9 +18,7 @@ class PlantNetResult {
 }
 
 class PlantNetApi {
-  static Future<List<PlantNetResult>> identify(
-    Uint8List imageBytes,
-  ) async {
+  static Future<List<PlantNetResult>> identify(Uint8List imageBytes) async {
     Uint8List compressedBytes;
 
     try {
@@ -36,33 +35,21 @@ class PlantNetApi {
       if (orientedImage.width > 1200 || orientedImage.height > 1200) {
         resizedImage = img.copyResize(
           orientedImage,
-          width: orientedImage.width >= orientedImage.height
-              ? 1200
-              : null,
-          height: orientedImage.height > orientedImage.width
-              ? 1200
-              : null,
+          width: orientedImage.width >= orientedImage.height ? 1200 : null,
+          height: orientedImage.height > orientedImage.width ? 1200 : null,
         );
       }
 
       compressedBytes = Uint8List.fromList(
-        img.encodeJpg(
-          resizedImage,
-          quality: 70,
-        ),
+        img.encodeJpg(resizedImage, quality: 70),
       );
     } catch (e) {
-      throw Exception(
-        'Не вдалося підготувати фотографію для PlantNet.',
-      );
+      throw Exception('Не вдалося підготувати фотографію для PlantNet.');
     }
 
     final uri = Uri.parse('/api/plantnet');
 
-    final request = http.MultipartRequest(
-      'POST',
-      uri,
-    );
+    final request = http.MultipartRequest('POST', uri);
 
     request.files.add(
       http.MultipartFile.fromBytes(
@@ -72,25 +59,24 @@ class PlantNetApi {
       ),
     );
 
+    final client = http.Client();
     try {
-      final response = await request.send().timeout(
+      final response = await client
+          .send(request)
+          .timeout(const Duration(seconds: 30));
+
+      final body = await response.stream.bytesToString().timeout(
         const Duration(seconds: 30),
       );
 
-      final body = await response.stream.bytesToString();
-
       if (response.statusCode != 200) {
-        throw Exception(
-          'PlantNet повернув помилку ${response.statusCode}.',
-        );
+        throw Exception('PlantNet повернув помилку ${response.statusCode}.');
       }
 
       final decoded = jsonDecode(body);
 
       if (decoded is! Map<String, dynamic>) {
-        throw Exception(
-          'PlantNet повернув некоректну відповідь.',
-        );
+        throw Exception('PlantNet повернув некоректну відповідь.');
       }
 
       final results = decoded['results'];
@@ -129,8 +115,7 @@ class PlantNetApi {
           commonName = scientificName;
         }
 
-        final score =
-            (item['score'] as num?)?.toDouble() ?? 0.0;
+        final score = (item['score'] as num?)?.toDouble() ?? 0.0;
 
         output.add(
           PlantNetResult(
@@ -143,13 +128,13 @@ class PlantNetApi {
 
       return output;
     } on http.ClientException catch (e) {
-      throw Exception(
-        'Помилка зʼєднання з PlantNet: $e',
-      );
+      throw Exception('Помилка зʼєднання з PlantNet: $e');
     } on FormatException {
-      throw Exception(
-        'PlantNet повернув неправильні дані.',
-      );
+      throw Exception('PlantNet повернув неправильні дані.');
+    } on TimeoutException {
+      throw Exception('PlantNet не відповів вчасно. Спробуй ще раз.');
+    } finally {
+      client.close();
     }
   }
 }

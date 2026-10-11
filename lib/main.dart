@@ -1,6 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:http/http.dart' as http;
@@ -29,9 +29,7 @@ class TreeApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Derevarium',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.green,
-        ),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
         useMaterial3: true,
       ),
       home: const HomePage(),
@@ -81,6 +79,28 @@ class Tree {
   }
 
   factory Tree.fromJson(Map<String, dynamic> json) {
+    for (final field in [
+      'type',
+      'name',
+      'location',
+      'locationType',
+      'facts',
+      'notes',
+      'imageBase64',
+      'dateFound',
+    ]) {
+      if (json[field] != null && json[field] is! String) {
+        throw FormatException('Некоректне поле $field');
+      }
+    }
+    for (final field in ['foundTogether', 'isRare']) {
+      if (json[field] != null && json[field] is! bool) {
+        throw FormatException('Некоректне поле $field');
+      }
+    }
+    if (json['imageBase64'] != null) {
+      base64Decode(json['imageBase64'] as String);
+    }
     return Tree(
       type: json['type'] ?? json['name'] ?? '',
       location: json['location'] ?? '',
@@ -88,11 +108,7 @@ class Tree {
       facts: json['facts'] ?? '',
       notes: json['notes'] ?? '',
       imageBase64: json['imageBase64'],
-      dateFound:
-          DateTime.tryParse(
-            json['dateFound'] ?? '',
-          ) ??
-          DateTime.now(),
+      dateFound: DateTime.tryParse(json['dateFound'] ?? '') ?? DateTime.now(),
       foundTogether: json['foundTogether'] ?? false,
       isRare: json['isRare'] ?? false,
     );
@@ -107,11 +123,14 @@ class TreeAction {
   final Tree? tree;
   final bool deleted;
 
-  TreeAction({
-    this.tree,
-    this.deleted = false,
-  });
+  TreeAction({this.tree, this.deleted = false});
 }
+
+typedef TreeSaveCallback = Future<bool> Function(TreeAction action);
+typedef TreeChangeCallback = Future<bool> Function(
+  Tree tree,
+  TreeAction action,
+);
 
 // ============================================================
 // FILTER
@@ -132,6 +151,9 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   List<Tree> trees = [];
+  final List<String> unreadableTrees = [];
+  bool treesLoaded = false;
+  bool savingTrees = false;
 
   String searchQuery = '';
   String selectedLocationFilter = allFilter;
@@ -154,28 +176,115 @@ class _HomePageState extends State<HomePage> {
   // ============================================================
 
   Future<void> loadTrees() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedTrees = prefs.getStringList('trees') ?? [];
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final savedTrees = prefs.getStringList('trees') ?? [];
+      final loadedTrees = <Tree>[];
+      final invalidTrees = <String>[];
+      for (final item in savedTrees) {
+        try {
+          loadedTrees.add(Tree.fromJson(jsonDecode(item)));
+        } catch (_) {
+          invalidTrees.add(item);
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        trees = loadedTrees;
+        unreadableTrees
+          ..clear()
+          ..addAll(invalidTrees);
+        treesLoaded = true;
+      });
+      if (invalidTrees.isNotEmpty) {
+        showStorageMessage(
+          'Не вдалося прочитати ${invalidTrees.length} записів. Решта дерев завантажена; пошкоджені записи збережено.',
+        );
+      }
+    } catch (_) {
+      if (!mounted) return;
+      showStorageMessage(
+        'Не вдалося прочитати збережені дерева. Спробуй ще раз.',
+        retry: loadTrees,
+      );
+    }
+  }
 
-    final loadedTrees = savedTrees.map((item) {
-      return Tree.fromJson(jsonDecode(item));
-    }).toList();
-
-    if (!mounted) return;
-
-    setState(() {
-      trees = loadedTrees;
+  void showStorageMessage(String message, {VoidCallback? retry}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          duration: const Duration(seconds: 8),
+          action: retry == null
+              ? null
+              : SnackBarAction(label: 'Повторити', onPressed: retry),
+        ),
+      );
     });
   }
 
-  Future<void> saveTrees() async {
+  Future<void> saveTrees(List<Tree> updatedTrees) async {
     final prefs = await SharedPreferences.getInstance();
-
-    final data = trees.map((tree) {
+    final data = updatedTrees.map((tree) {
       return jsonEncode(tree.toJson());
-    }).toList();
+    }).toList()..addAll(unreadableTrees);
+    try {
+      if (!await prefs.setStringList('trees', data)) {
+        throw StateError('Storage rejected the write');
+      }
+    } catch (_) {
+      // SharedPreferences changes its memory cache before the write completes.
+      try {
+        await prefs.reload();
+      } catch (_) {}
+      rethrow;
+    }
+  }
 
-    await prefs.setStringList('trees', data);
+  Future<bool> applyTreeAction(TreeAction action, {Tree? original}) async {
+    if (!mounted || !treesLoaded || savingTrees) return false;
+    final updatedTrees = List<Tree>.of(trees);
+    if (original == null) {
+      if (action.tree == null || action.deleted) return false;
+      updatedTrees.add(action.tree!);
+    } else {
+      final index = updatedTrees.indexOf(original);
+      if (index < 0) return false;
+      if (action.deleted) {
+        updatedTrees.removeAt(index);
+      } else if (action.tree != null) {
+        updatedTrees[index] = action.tree!;
+      } else {
+        return false;
+      }
+    }
+    savingTrees = true;
+    try {
+      await saveTrees(updatedTrees);
+      if (mounted) {
+        setState(() {
+          trees = updatedTrees;
+          if (!locations.contains(selectedLocationFilter)) {
+            selectedLocationFilter = allFilter;
+          }
+          if (!treeTypes.contains(selectedTypeFilter)) {
+            selectedTypeFilter = allFilter;
+          }
+        });
+      }
+      return true;
+    } catch (_) {
+      if (mounted) {
+        showStorageMessage(
+          'Не вдалося зберегти зміни. Можливо, сховище браузера заповнене. Попередні дерева залишилися; спробуй фото меншого розміру або повтори збереження.',
+        );
+      }
+      return false;
+    } finally {
+      savingTrees = false;
+    }
   }
 
   // ============================================================
@@ -183,20 +292,17 @@ class _HomePageState extends State<HomePage> {
   // ============================================================
 
   Future<void> addTree() async {
-    final result = await Navigator.push<TreeAction>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => const AddTreePage(),
-      ),
-    );
-
-    if (result != null && result.tree != null) {
-      setState(() {
-        trees.add(result.tree!);
-      });
-
-      await saveTrees();
+    if (!treesLoaded) {
+      showStorageMessage(
+        'Спочатку потрібно завантажити збережені дерева.',
+        retry: loadTrees,
+      );
+      return;
     }
+    await Navigator.push<TreeAction>(
+      context,
+      MaterialPageRoute(builder: (_) => AddTreePage(onSave: applyTreeAction)),
+    );
   }
 
   // ============================================================
@@ -204,33 +310,16 @@ class _HomePageState extends State<HomePage> {
   // ============================================================
 
   Future<void> openTree(int index) async {
-    final result = await Navigator.push<TreeAction>(
+    final tree = trees[index];
+    await Navigator.push<TreeAction>(
       context,
       MaterialPageRoute(
         builder: (_) => TreeDetailsPage(
-          tree: trees[index],
+          tree: tree,
+          onSave: (action) => applyTreeAction(action, original: tree),
         ),
       ),
     );
-
-    if (result == null) return;
-
-    if (result.deleted) {
-      setState(() {
-        trees.removeAt(index);
-      });
-
-      await saveTrees();
-      return;
-    }
-
-    if (result.tree != null) {
-      setState(() {
-        trees[index] = result.tree!;
-      });
-
-      await saveTrees();
-    }
   }
 
   // ============================================================
@@ -287,12 +376,9 @@ class _HomePageState extends State<HomePage> {
           tree.location == selectedLocationFilter;
 
       final matchesType =
-          selectedTypeFilter == allFilter ||
-          tree.type == selectedTypeFilter;
+          selectedTypeFilter == allFilter || tree.type == selectedTypeFilter;
 
-      return matchesSearch &&
-          matchesLocation &&
-          matchesType;
+      return matchesSearch && matchesLocation && matchesType;
     }).toList();
   }
 
@@ -329,11 +415,7 @@ class _HomePageState extends State<HomePage> {
   void openStats() {
     Navigator.push(
       context,
-      MaterialPageRoute(
-        builder: (_) => StatsPage(
-          trees: trees,
-        ),
-      ),
+      MaterialPageRoute(builder: (_) => StatsPage(trees: trees)),
     );
   }
 
@@ -341,211 +423,193 @@ class _HomePageState extends State<HomePage> {
   // HOME CONTENT
   // ============================================================
 
-Widget buildHomeContent() {
-  return Container(
-    decoration: const BoxDecoration(
-      gradient: LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: [
-          Color(0xFF3E8055),
-          Color(0xFF17452F),
-        ],
+  Widget buildHomeContent() {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF3E8055), Color(0xFF17452F)],
+        ),
       ),
-    ),
-    child: Stack(
-      children: [
-        // ======================================================
-        // DECORATIVE LEAVES
-        // ======================================================
+      child: Stack(
+        children: [
+          // ======================================================
+          // DECORATIVE LEAVES
+          // ======================================================
 
-        const Positioned(
-          top: 105,
-          left: -18,
-          child: Text(
-            '🍃',
-            style: TextStyle(fontSize: 78),
+          const Positioned(
+            top: 105,
+            left: -18,
+            child: Text('🍃', style: TextStyle(fontSize: 78)),
           ),
-        ),
 
-        const Positioned(
-          top: 220,
-          right: -28,
-          child: Text(
-            '🌿',
-            style: TextStyle(fontSize: 88),
+          const Positioned(
+            top: 220,
+            right: -28,
+            child: Text('🌿', style: TextStyle(fontSize: 88)),
           ),
-        ),
 
-        const Positioned(
-          bottom: 205,
-          left: -25,
-          child: Text(
-            '🌿',
-            style: TextStyle(fontSize: 82),
+          const Positioned(
+            bottom: 205,
+            left: -25,
+            child: Text('🌿', style: TextStyle(fontSize: 82)),
           ),
-        ),
 
-        const Positioned(
-          bottom: 135,
-          right: -18,
-          child: Text(
-            '🍃',
-            style: TextStyle(fontSize: 72),
+          const Positioned(
+            bottom: 135,
+            right: -18,
+            child: Text('🍃', style: TextStyle(fontSize: 72)),
           ),
-        ),
 
-        // ======================================================
-        // TITLE
-        // ======================================================
-
-        Positioned(
-          top: 24,
-          left: 0,
-          right: 0,
-          child: SafeArea(
-            bottom: false,
-            child: const Center(
-              child: Text(
-                '🌿 Derevarium',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 25,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 0.5,
+          // ======================================================
+          // TITLE
+          // ======================================================
+          Positioned(
+            top: 24,
+            left: 0,
+            right: 0,
+            child: SafeArea(
+              bottom: false,
+              child: const Center(
+                child: Text(
+                  '🌿 Derevarium',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 25,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.5,
+                  ),
                 ),
               ),
             ),
           ),
-        ),
 
-        // ======================================================
-        // MAIN BUTTON
-        // ======================================================
-
-        Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              GestureDetector(
-                onTap: addTree,
-                child: Container(
-                  width: 165,
-                  height: 165,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: const Color(0xFF78A878),
-                    border: Border.all(
-                      color: Colors.white.withOpacity(0.9),
-                      width: 4,
+          // ======================================================
+          // MAIN BUTTON
+          // ======================================================
+          Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                GestureDetector(
+                  onTap: addTree,
+                  child: Container(
+                    width: 165,
+                    height: 165,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: const Color(0xFF78A878),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.9),
+                        width: 4,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.28),
+                          blurRadius: 22,
+                          offset: const Offset(0, 10),
+                        ),
+                      ],
                     ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.28),
-                        blurRadius: 22,
-                        offset: const Offset(0, 10),
-                      ),
-                    ],
-                  ),
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      const Icon(
-                        Icons.photo_camera_rounded,
-                        size: 62,
-                        color: Colors.white,
-                      ),
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        const Icon(
+                          Icons.photo_camera_rounded,
+                          size: 62,
+                          color: Colors.white,
+                        ),
 
-                      Positioned(
-                        right: 38,
-                        bottom: 38,
-                        child: Container(
-                          width: 38,
-                          height: 38,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.white,
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.2),
-                                blurRadius: 6,
-                              ),
-                            ],
-                          ),
-                          child: const Icon(
-                            Icons.add,
-                            size: 25,
-                            color: Color(0xFF2F6B45),
+                        Positioned(
+                          right: 38,
+                          bottom: 38,
+                          child: Container(
+                            width: 38,
+                            height: 38,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.white,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.2),
+                                  blurRadius: 6,
+                                ),
+                              ],
+                            ),
+                            child: const Icon(
+                              Icons.add,
+                              size: 25,
+                              color: Color(0xFF2F6B45),
+                            ),
                           ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
-              ),
 
-              const SizedBox(height: 20),
+                const SizedBox(height: 20),
 
-              const Text(
-                'Знайти дерево',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 23,
-                  fontWeight: FontWeight.w600,
+                const Text(
+                  'Знайти дерево',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 23,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-              ),
 
-              const SizedBox(height: 7),
+                const SizedBox(height: 7),
 
-              Text(
-                'Сфотографуйте новий вид',
-                style: TextStyle(
-                  color: Colors.white.withOpacity(0.72),
-                  fontSize: 14,
+                Text(
+                  'Сфотографуйте новий вид',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.72),
+                    fontSize: 14,
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
-        ),
 
-        // ======================================================
-        // COLLECTION COUNTER
-        // ======================================================
-
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: 92,
-          child: Center(
-            child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 20,
-                vertical: 10,
-              ),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.10),
-                borderRadius: BorderRadius.circular(30),
-                border: Border.all(
-                  color: Colors.white.withOpacity(0.15),
+          // ======================================================
+          // COLLECTION COUNTER
+          // ======================================================
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 92,
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 10,
                 ),
-              ),
-              child: Text(
-                trees.isEmpty
-                    ? '🌱 Почніть свою колекцію'
-                    : '🌳 Відкрито видів: $uniqueTypesCount',
-                style: TextStyle(
-                  color: Colors.white.withOpacity(0.9),
-                  fontSize: 14,
-                  fontWeight: FontWeight.w500,
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(30),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.15),
+                  ),
+                ),
+                child: Text(
+                  trees.isEmpty
+                      ? '🌱 Почніть свою колекцію'
+                      : '🌳 Відкрито видів: $uniqueTypesCount',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.9),
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                  ),
                 ),
               ),
             ),
           ),
-        ),
-      ],
-    ),
-  );
-}
+        ],
+      ),
+    );
+  }
 
   // ============================================================
   // BUILD
@@ -558,7 +622,10 @@ Widget buildHomeContent() {
         index: selectedTab,
         children: [
           buildHomeContent(),
-          BestiaryPage(trees: trees),
+          BestiaryPage(
+            trees: trees,
+            onChange: (tree, action) => applyTreeAction(action, original: tree),
+          ),
           MapPage(trees: trees),
           AchievementsPage(trees: trees),
         ],
@@ -607,58 +674,6 @@ Widget buildHomeContent() {
 // HOME STAT CARD
 // ============================================================
 
-class _HomeStatCard extends StatelessWidget {
-  final IconData icon;
-  final String value;
-  final String label;
-
-  const _HomeStatCard({
-    required this.icon,
-    required this.value,
-    required this.label,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(
-        vertical: 14,
-        horizontal: 8,
-      ),
-      decoration: BoxDecoration(
-        color: Colors.grey.shade100,
-        borderRadius:
-            BorderRadius.circular(18),
-      ),
-      child: Column(
-        children: [
-          Icon(
-            icon,
-            color: Colors.green,
-            size: 25,
-          ),
-          const SizedBox(height: 6),
-          Text(
-            value,
-            style: const TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            label,
-            style: const TextStyle(
-              fontSize: 12,
-              color: Colors.grey,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 // ============================================================
 // TREE CARD
 // ============================================================
@@ -667,11 +682,7 @@ class TreeCard extends StatelessWidget {
   final Tree tree;
   final VoidCallback onTap;
 
-  const TreeCard({
-    super.key,
-    required this.tree,
-    required this.onTap,
-  });
+  const TreeCard({super.key, required this.tree, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -685,13 +696,10 @@ class TreeCard extends StatelessWidget {
           child: Row(
             children: [
               ClipRRect(
-                borderRadius:
-                    BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(12),
                 child: tree.imageBase64 != null
                     ? Image.memory(
-                        base64Decode(
-                          tree.imageBase64!,
-                        ),
+                        base64Decode(tree.imageBase64!),
                         width: 90,
                         height: 90,
                         fit: BoxFit.cover,
@@ -699,8 +707,7 @@ class TreeCard extends StatelessWidget {
                     : Container(
                         width: 90,
                         height: 90,
-                        color:
-                            Colors.green.shade100,
+                        color: Colors.green.shade100,
                         child: const Icon(
                           Icons.park,
                           size: 45,
@@ -711,53 +718,36 @@ class TreeCard extends StatelessWidget {
               const SizedBox(width: 14),
               Expanded(
                 child: Column(
-                  crossAxisAlignment:
-                      CrossAxisAlignment.start,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Row(
                       children: [
                         Expanded(
                           child: Text(
                             tree.type,
-                            style:
-                                const TextStyle(
+                            style: const TextStyle(
                               fontSize: 19,
-                              fontWeight:
-                                  FontWeight.bold,
+                              fontWeight: FontWeight.bold,
                             ),
                           ),
                         ),
                         if (tree.isRare)
-                          const Icon(
-                            Icons.star,
-                            color: Colors.amber,
-                            size: 20,
-                          ),
+                          const Icon(Icons.star, color: Colors.amber, size: 20),
                         if (tree.foundTogether)
                           const Padding(
-                            padding:
-                                EdgeInsets.only(
-                              left: 5,
-                            ),
+                            padding: EdgeInsets.only(left: 5),
                             child: Icon(
                               Icons.favorite,
                               color: Colors.pink,
                               size: 19,
                             ),
                           ),
-                        if (tree.notes
-                            .trim()
-                            .isNotEmpty)
+                        if (tree.notes.trim().isNotEmpty)
                           const Padding(
-                            padding:
-                                EdgeInsets.only(
-                              left: 5,
-                            ),
+                            padding: EdgeInsets.only(left: 5),
                             child: Icon(
-                              Icons
-                                  .sticky_note_2_outlined,
-                              color:
-                                  Colors.orange,
+                              Icons.sticky_note_2_outlined,
+                              color: Colors.orange,
                               size: 19,
                             ),
                           ),
@@ -775,9 +765,7 @@ class TreeCard extends StatelessWidget {
                         Expanded(
                           child: Text(
                             tree.location,
-                            overflow:
-                                TextOverflow
-                                    .ellipsis,
+                            overflow: TextOverflow.ellipsis,
                           ),
                         ),
                       ],
@@ -785,11 +773,7 @@ class TreeCard extends StatelessWidget {
                     const SizedBox(height: 4),
                     Row(
                       children: [
-                        const Icon(
-                          Icons
-                              .calendar_month_outlined,
-                          size: 17,
-                        ),
+                        const Icon(Icons.calendar_month_outlined, size: 17),
                         const SizedBox(width: 4),
                         Text(
                           '${tree.dateFound.day.toString().padLeft(2, '0')}.'
@@ -801,9 +785,7 @@ class TreeCard extends StatelessWidget {
                   ],
                 ),
               ),
-              const Icon(
-                Icons.chevron_right,
-              ),
+              const Icon(Icons.chevron_right),
             ],
           ),
         ),
@@ -818,21 +800,16 @@ class TreeCard extends StatelessWidget {
 
 class BestiaryPage extends StatefulWidget {
   final List<Tree> trees;
+  final TreeChangeCallback onChange;
 
-  const BestiaryPage({
-    super.key,
-    required this.trees,
-  });
+  const BestiaryPage({super.key, required this.trees, required this.onChange});
 
   @override
-  State<BestiaryPage> createState() =>
-      _BestiaryPageState();
+  State<BestiaryPage> createState() => _BestiaryPageState();
 }
 
-class _BestiaryPageState
-    extends State<BestiaryPage> {
-  final TextEditingController searchController =
-      TextEditingController();
+class _BestiaryPageState extends State<BestiaryPage> {
+  final TextEditingController searchController = TextEditingController();
 
   String filter = 'Усі';
 
@@ -875,21 +852,14 @@ class _BestiaryPageState
   }
 
   List<String> get allSpecies {
-    final result = <String>{
-      ...catalog,
-      ...groupedTrees.keys,
-    };
+    final result = <String>{...catalog, ...groupedTrees.keys};
 
-    final query =
-        searchController.text.trim().toLowerCase();
+    final query = searchController.text.trim().toLowerCase();
 
     final filtered = result.where((type) {
-      final matchesSearch =
-          query.isEmpty ||
-          type.toLowerCase().contains(query);
+      final matchesSearch = query.isEmpty || type.toLowerCase().contains(query);
 
-      final found =
-          groupedTrees.containsKey(type);
+      final found = groupedTrees.containsKey(type);
 
       final matchesFilter =
           filter == 'Усі' ||
@@ -900,10 +870,8 @@ class _BestiaryPageState
     }).toList();
 
     filtered.sort((a, b) {
-      final aFound =
-          groupedTrees.containsKey(a);
-      final bFound =
-          groupedTrees.containsKey(b);
+      final aFound = groupedTrees.containsKey(a);
+      final bFound = groupedTrees.containsKey(b);
 
       if (aFound != bFound) {
         return aFound ? -1 : 1;
@@ -916,8 +884,7 @@ class _BestiaryPageState
   }
 
   void openSpecies(String type) {
-    final speciesTrees =
-        groupedTrees[type] ?? [];
+    final speciesTrees = groupedTrees[type] ?? [];
 
     if (speciesTrees.isEmpty) return;
 
@@ -927,6 +894,7 @@ class _BestiaryPageState
         builder: (_) => BestiarySpeciesPage(
           type: type,
           trees: speciesTrees,
+          onChange: widget.onChange,
         ),
       ),
     );
@@ -942,105 +910,71 @@ class _BestiaryPageState
       appBar: AppBar(
         title: const Text(
           '📖 Бестіарій',
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-          ),
+          style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
       body: Column(
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(
-              16,
-              16,
-              16,
-              10,
-            ),
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 10),
             child: Row(
               children: [
                 Expanded(
                   child: Column(
-                    crossAxisAlignment:
-                        CrossAxisAlignment.start,
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
                         '$foundCount / $totalCount',
-                        style:
-                            const TextStyle(
+                        style: const TextStyle(
                           fontSize: 25,
-                          fontWeight:
-                              FontWeight.bold,
+                          fontWeight: FontWeight.bold,
                         ),
                       ),
                       const Text(
                         'видів відкрито',
-                        style: TextStyle(
-                          color: Colors.grey,
-                        ),
+                        style: TextStyle(color: Colors.grey),
                       ),
                     ],
                   ),
                 ),
-                const Icon(
-                  Icons.auto_stories,
-                  size: 38,
-                  color: Colors.green,
-                ),
+                const Icon(Icons.auto_stories, size: 38, color: Colors.green),
               ],
             ),
           ),
           Padding(
-            padding:
-                const EdgeInsets.symmetric(
-              horizontal: 16,
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 16),
             child: TextField(
-              controller:
-                  searchController,
+              controller: searchController,
               onChanged: (_) {
                 setState(() {});
               },
               decoration: InputDecoration(
-                hintText:
-                    'Пошук виду...',
-                prefixIcon:
-                    const Icon(Icons.search),
-                suffixIcon:
-                    searchController
-                            .text
-                            .isNotEmpty
-                        ? IconButton(
-                            onPressed: () {
-                              searchController.clear();
-                              setState(() {});
-                            },
-                            icon:
-                                const Icon(
-                              Icons.clear,
-                            ),
-                          )
-                        : null,
+                hintText: 'Пошук виду...',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: searchController.text.isNotEmpty
+                    ? IconButton(
+                        onPressed: () {
+                          searchController.clear();
+                          setState(() {});
+                        },
+                        icon: const Icon(Icons.clear),
+                      )
+                    : null,
                 border: OutlineInputBorder(
-                  borderRadius:
-                      BorderRadius.circular(14),
+                  borderRadius: BorderRadius.circular(14),
                 ),
               ),
             ),
           ),
           const SizedBox(height: 10),
           SingleChildScrollView(
-            scrollDirection:
-                Axis.horizontal,
-            padding:
-                const EdgeInsets.symmetric(
-              horizontal: 16,
-            ),
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Row(
               children: [
                 _BestiaryFilterChip(
                   label: 'Усі',
-                  selected:
-                      filter == 'Усі',
+                  selected: filter == 'Усі',
                   onTap: () {
                     setState(() {
                       filter = 'Усі';
@@ -1049,23 +983,19 @@ class _BestiaryPageState
                 ),
                 _BestiaryFilterChip(
                   label: '🌳 Знайдені',
-                  selected:
-                      filter == 'Знайдені',
+                  selected: filter == 'Знайдені',
                   onTap: () {
                     setState(() {
-                      filter =
-                          'Знайдені';
+                      filter = 'Знайдені';
                     });
                   },
                 ),
                 _BestiaryFilterChip(
                   label: '🔒 Незнайдені',
-                  selected:
-                      filter == 'Незнайдені',
+                  selected: filter == 'Незнайдені',
                   onTap: () {
                     setState(() {
-                      filter =
-                          'Незнайдені';
+                      filter = 'Незнайдені';
                     });
                   },
                 ),
@@ -1078,47 +1008,31 @@ class _BestiaryPageState
                 ? const Center(
                     child: Text(
                       'Нічого не знайдено 🔍',
-                      style:
-                          TextStyle(
-                        fontSize: 18,
-                      ),
+                      style: TextStyle(fontSize: 18),
                     ),
                   )
                 : GridView.builder(
-                    padding:
-                        const EdgeInsets.all(
-                      16,
-                    ),
+                    padding: const EdgeInsets.all(16),
                     gridDelegate:
                         const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 2,
-                      crossAxisSpacing: 12,
-                      mainAxisSpacing: 12,
-                      childAspectRatio: 0.82,
-                    ),
-                    itemCount:
-                        species.length,
-                    itemBuilder:
-                        (context, index) {
-                      final type =
-                          species[index];
+                          crossAxisCount: 2,
+                          crossAxisSpacing: 12,
+                          mainAxisSpacing: 12,
+                          childAspectRatio: 0.82,
+                        ),
+                    itemCount: species.length,
+                    itemBuilder: (context, index) {
+                      final type = species[index];
 
-                      final finds =
-                          groupedTrees[type];
+                      final finds = groupedTrees[type];
 
-                      final isFound =
-                          finds != null &&
-                              finds.isNotEmpty;
+                      final isFound = finds != null && finds.isNotEmpty;
 
                       return _BestiaryTile(
                         type: type,
                         trees: finds ?? [],
-                        isFound:
-                            isFound,
-                        onTap: isFound
-                            ? () =>
-                                openSpecies(type)
-                            : null,
+                        isFound: isFound,
+                        onTap: isFound ? () => openSpecies(type) : null,
                       );
                     },
                   ),
@@ -1133,8 +1047,7 @@ class _BestiaryPageState
 // BESTIARY FILTER CHIP
 // ============================================================
 
-class _BestiaryFilterChip
-    extends StatelessWidget {
+class _BestiaryFilterChip extends StatelessWidget {
   final String label;
   final bool selected;
   final VoidCallback onTap;
@@ -1148,8 +1061,7 @@ class _BestiaryFilterChip
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding:
-          const EdgeInsets.only(right: 8),
+      padding: const EdgeInsets.only(right: 8),
       child: ChoiceChip(
         label: Text(label),
         selected: selected,
@@ -1163,8 +1075,7 @@ class _BestiaryFilterChip
 // BESTIARY TILE
 // ============================================================
 
-class _BestiaryTile
-    extends StatelessWidget {
+class _BestiaryTile extends StatelessWidget {
   final String type;
   final List<Tree> trees;
   final bool isFound;
@@ -1179,27 +1090,19 @@ class _BestiaryTile
 
   @override
   Widget build(BuildContext context) {
-    final firstTree =
-        isFound ? trees.first : null;
+    final firstTree = isFound ? trees.first : null;
 
     return Card(
-      clipBehavior:
-          Clip.antiAlias,
+      clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onTap,
         child: Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.stretch,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Expanded(
-              child: isFound &&
-                      firstTree!.imageBase64 !=
-                          null
+              child: isFound && firstTree!.imageBase64 != null
                   ? Image.memory(
-                      base64Decode(
-                        firstTree
-                            .imageBase64!,
-                      ),
+                      base64Decode(firstTree.imageBase64!),
                       fit: BoxFit.cover,
                     )
                   : Container(
@@ -1211,58 +1114,42 @@ class _BestiaryTile
                             ? const Icon(
                                 Icons.park,
                                 size: 65,
-                                color:
-                                    Colors.green,
+                                color: Colors.green,
                               )
                             : Icon(
                                 Icons.lock_outline,
                                 size: 52,
-                                color: Colors
-                                    .grey.shade500,
+                                color: Colors.grey.shade500,
                               ),
                       ),
                     ),
             ),
             Padding(
-              padding:
-                  const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(12),
               child: Column(
-                crossAxisAlignment:
-                    CrossAxisAlignment.start,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
                     isFound ? type : '???',
                     maxLines: 1,
-                    overflow:
-                        TextOverflow.ellipsis,
-                    style:
-                        const TextStyle(
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
                       fontSize: 17,
-                      fontWeight:
-                          FontWeight.bold,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
-                  const SizedBox(
-                    height: 4,
-                  ),
+                  const SizedBox(height: 4),
                   if (isFound)
                     Row(
                       children: [
-                        const Icon(
-                          Icons.eco,
-                          size: 16,
-                          color:
-                              Colors.green,
-                        ),
-                        const SizedBox(
-                          width: 4,
-                        ),
-                        Text(
-                          '${trees.length} ${trees.length == 1 ? 'знахідка' : 'знахідки'}',
-                          style:
-                              const TextStyle(
-                            color:
-                                Colors.grey,
+                        const Icon(Icons.eco, size: 16, color: Colors.green),
+                        const SizedBox(width: 4),
+                        Expanded(
+                          child: Text(
+                            '${trees.length} ${trees.length == 1 ? 'знахідка' : 'знахідки'}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: Colors.grey),
                           ),
                         ),
                       ],
@@ -1270,11 +1157,7 @@ class _BestiaryTile
                   else
                     const Text(
                       'Ще не знайдено',
-                      style:
-                          TextStyle(
-                        color:
-                            Colors.grey,
-                      ),
+                      style: TextStyle(color: Colors.grey),
                     ),
                 ],
               ),
@@ -1290,68 +1173,50 @@ class _BestiaryTile
 // BESTIARY SPECIES PAGE
 // ============================================================
 
-class BestiarySpeciesPage
-    extends StatelessWidget {
+class BestiarySpeciesPage extends StatelessWidget {
   final String type;
   final List<Tree> trees;
+  final TreeChangeCallback onChange;
 
   const BestiarySpeciesPage({
     super.key,
     required this.type,
     required this.trees,
+    required this.onChange,
   });
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          type,
-          style:
-              const TextStyle(
-            fontWeight:
-                FontWeight.bold,
-          ),
-        ),
+        title: Text(type, style: const TextStyle(fontWeight: FontWeight.bold)),
       ),
       body: ListView(
-        padding:
-            const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(16),
         children: [
           Card(
             child: Padding(
-              padding:
-                  const EdgeInsets.all(18),
+              padding: const EdgeInsets.all(18),
               child: Row(
                 children: [
                   const CircleAvatar(
                     radius: 30,
-                    child: Icon(
-                      Icons.eco,
-                      size: 30,
-                    ),
+                    child: Icon(Icons.eco, size: 30),
                   ),
                   const SizedBox(width: 14),
                   Expanded(
                     child: Column(
-                      crossAxisAlignment:
-                          CrossAxisAlignment.start,
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
                           type,
-                          style:
-                              const TextStyle(
+                          style: const TextStyle(
                             fontSize: 23,
-                            fontWeight:
-                                FontWeight.bold,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
-                        const SizedBox(
-                          height: 4,
-                        ),
-                        Text(
-                          'У вашій колекції: ${trees.length}',
-                        ),
+                        const SizedBox(height: 4),
+                        Text('У вашій колекції: ${trees.length}'),
                       ],
                     ),
                   ),
@@ -1359,148 +1224,99 @@ class BestiarySpeciesPage
               ),
             ),
           ),
-          const SizedBox(
-            height: 16,
-          ),
-          ...trees.asMap().entries.map(
-            (entry) {
-              final index =
-                  entry.key;
-              final tree =
-                  entry.value;
+          const SizedBox(height: 16),
+          ...trees.asMap().entries.map((entry) {
+            final index = entry.key;
+            final tree = entry.value;
 
-              return Card(
-                margin:
-                    const EdgeInsets.only(
-                  bottom: 12,
-                ),
-                clipBehavior:
-                    Clip.antiAlias,
-                child: InkWell(
-                  onTap: () async {
-                    final result =
-                        await Navigator.push<
-                            TreeAction>(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            TreeDetailsPage(
-                          tree:
-                              tree,
+            return Card(
+              margin: const EdgeInsets.only(bottom: 12),
+              clipBehavior: Clip.antiAlias,
+              child: InkWell(
+                onTap: () async {
+                  final result = await Navigator.push<TreeAction>(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => TreeDetailsPage(
+                        tree: tree,
+                        onSave: (action) => onChange(tree, action),
+                      ),
+                    ),
+                  );
+
+                  if (result != null && context.mounted) {
+                    Navigator.pop(context, result);
+                  }
+                },
+                child: Row(
+                  children: [
+                    if (tree.imageBase64 != null)
+                      Image.memory(
+                        base64Decode(tree.imageBase64!),
+                        width: 110,
+                        height: 110,
+                        fit: BoxFit.cover,
+                      )
+                    else
+                      Container(
+                        width: 110,
+                        height: 110,
+                        color: Colors.green.shade100,
+                        child: const Icon(
+                          Icons.park,
+                          size: 45,
+                          color: Colors.green,
                         ),
                       ),
-                    );
-
-                    if (result !=
-                        null) {
-                      Navigator.pop(
-                        context,
-                        result,
-                      );
-                    }
-                  },
-                  child: Row(
-                    children: [
-                      if (tree.imageBase64 !=
-                          null)
-                        Image.memory(
-                          base64Decode(
-                            tree.imageBase64!,
-                          ),
-                          width: 110,
-                          height: 110,
-                          fit: BoxFit.cover,
-                        )
-                      else
-                        Container(
-                          width: 110,
-                          height: 110,
-                          color:
-                              Colors.green.shade100,
-                          child:
-                              const Icon(
-                            Icons.park,
-                            size: 45,
-                            color:
-                                Colors.green,
-                          ),
-                        ),
-                      Expanded(
-                        child: Padding(
-                          padding:
-                              const EdgeInsets.all(
-                            14,
-                          ),
-                          child: Column(
-                            crossAxisAlignment:
-                                CrossAxisAlignment
-                                    .start,
-                            children: [
-                              Text(
-                                'Знахідка №${index + 1}',
-                                style:
-                                    const TextStyle(
-                                  fontSize: 17,
-                                  fontWeight:
-                                      FontWeight.bold,
-                                ),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Знахідка №${index + 1}',
+                              style: const TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.bold,
                               ),
-                              const SizedBox(
-                                height: 6,
-                              ),
-                              Text(
-                                '📍 ${tree.location}',
-                                maxLines: 2,
-                                overflow:
-                                    TextOverflow
-                                        .ellipsis,
-                              ),
-                              const SizedBox(
-                                height: 4,
-                              ),
-                              Text(
-                                '${tree.dateFound.day.toString().padLeft(2, '0')}.'
-                                '${tree.dateFound.month.toString().padLeft(2, '0')}.'
-                                '${tree.dateFound.year}',
-                              ),
-                              if (tree.foundTogether)
-                                const Padding(
-                                  padding:
-                                      EdgeInsets.only(
-                                    top: 6,
-                                  ),
-                                  child:
-                                      Text(
-                                    '❤️ Знайдено разом',
-                                    style:
-                                        TextStyle(
-                                      color:
-                                          Colors.pink,
-                                      fontWeight:
-                                          FontWeight.w600,
-                                    ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              '📍 ${tree.location}',
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${tree.dateFound.day.toString().padLeft(2, '0')}.'
+                              '${tree.dateFound.month.toString().padLeft(2, '0')}.'
+                              '${tree.dateFound.year}',
+                            ),
+                            if (tree.foundTogether)
+                              const Padding(
+                                padding: EdgeInsets.only(top: 6),
+                                child: Text(
+                                  '❤️ Знайдено разом',
+                                  style: TextStyle(
+                                    color: Colors.pink,
+                                    fontWeight: FontWeight.w600,
                                   ),
                                 ),
-                            ],
-                          ),
+                              ),
+                          ],
                         ),
                       ),
-                      const Padding(
-                        padding:
-                            EdgeInsets.only(
-                          right: 10,
-                        ),
-                        child:
-                            Icon(
-                          Icons.chevron_right,
-                        ),
-                      ),
-                    ],
-                  ),
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.only(right: 10),
+                      child: Icon(Icons.chevron_right),
+                    ),
+                  ],
                 ),
-              );
-            },
-          ),
+              ),
+            );
+          }),
         ],
       ),
     );
@@ -1511,41 +1327,30 @@ class BestiarySpeciesPage
 // ADD / EDIT TREE PAGE
 // ============================================================
 
-class AddTreePage
-    extends StatefulWidget {
+class AddTreePage extends StatefulWidget {
   final Tree? tree;
+  final TreeSaveCallback onSave;
 
-  const AddTreePage({
-    super.key,
-    this.tree,
-  });
+  const AddTreePage({super.key, this.tree, required this.onSave});
 
   @override
-  State<AddTreePage> createState() =>
-      _AddTreePageState();
+  State<AddTreePage> createState() => _AddTreePageState();
 }
 
-class _AddTreePageState
-    extends State<AddTreePage> {
-  final locationController =
-      TextEditingController();
+class _AddTreePageState extends State<AddTreePage> {
+  final locationController = TextEditingController();
 
-  final factsController =
-      TextEditingController();
+  final factsController = TextEditingController();
 
-  final notesController =
-      TextEditingController();
+  final notesController = TextEditingController();
 
-  final ImagePicker picker =
-      ImagePicker();
+  final ImagePicker picker = ImagePicker();
 
   String? selectedTreeType;
   String? selectedLocation;
-  String selectedLocationType =
-      'Місто';
+  String selectedLocationType = 'Місто';
 
-  DateTime selectedDate =
-      DateTime.now();
+  DateTime selectedDate = DateTime.now();
 
   String? imageBase64;
 
@@ -1554,9 +1359,9 @@ class _AddTreePageState
 
   bool identifying = false;
   bool loadingFacts = false;
+  bool saving = false;
 
-  bool get isEditing =>
-      widget.tree != null;
+  bool get isEditing => widget.tree != null;
 
   final List<String> standardTreeTypes = [
     'Дуб',
@@ -1590,36 +1395,25 @@ class _AddTreePageState
     super.initState();
 
     if (widget.tree != null) {
-      final tree =
-          widget.tree!;
+      final tree = widget.tree!;
 
-      selectedTreeType =
-          tree.type;
-      selectedLocation =
-          tree.location;
-      selectedLocationType =
-          tree.locationType;
+      selectedTreeType = tree.type;
+      selectedLocation = tree.location;
+      selectedLocationType = tree.locationType;
 
-      locationController.text =
-          tree.location;
+      locationController.text = tree.location;
 
-      factsController.text =
-          tree.facts;
+      factsController.text = tree.facts;
 
-      notesController.text =
-          tree.notes;
+      notesController.text = tree.notes;
 
-      selectedDate =
-          tree.dateFound;
+      selectedDate = tree.dateFound;
 
-      imageBase64 =
-          tree.imageBase64;
+      imageBase64 = tree.imageBase64;
 
-      foundTogether =
-          tree.foundTogether;
+      foundTogether = tree.foundTogether;
 
-      isRare =
-          tree.isRare;
+      isRare = tree.isRare;
     }
   }
 
@@ -1632,113 +1426,87 @@ class _AddTreePageState
   }
 
   List<String> get typeItems {
-    final items = [
-      ...standardTreeTypes,
-    ];
+    final items = [...standardTreeTypes];
 
     if (selectedTreeType != null &&
         selectedTreeType!.isNotEmpty &&
-        !items.contains(
-          selectedTreeType,
-        )) {
-      items.add(
-        selectedTreeType!,
-      );
+        !items.contains(selectedTreeType)) {
+      items.add(selectedTreeType!);
     }
 
-    items.add(
-      'Інше...',
-    );
+    items.add('Інше...');
 
     return items;
   }
 
   List<String> get locationItems {
-    final items = [
-      ...standardLocations,
-    ];
+    final items = [...standardLocations];
 
     if (selectedLocation != null &&
         selectedLocation!.isNotEmpty &&
-        !items.contains(
-          selectedLocation,
-        )) {
-      items.add(
-        selectedLocation!,
-      );
+        !items.contains(selectedLocation)) {
+      items.add(selectedLocation!);
     }
 
-    items.add(
-      'Інше...',
-    );
+    items.add('Інше...');
 
     return items;
   }
 
   Future<void> pickImage() async {
-  final XFile? image = await picker.pickImage(
-    source: ImageSource.gallery,
-    imageQuality: 75,
-    maxWidth: 1000,
-  );
+    final XFile? image = await picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 75,
+      maxWidth: 1000,
+    );
 
-  if (image == null) return;
+    if (image == null) return;
 
-  final bytes = await image.readAsBytes();
+    final bytes = await image.readAsBytes();
+    if (!mounted) return;
 
-  try {
-    final originalImage = img.decodeImage(bytes);
+    try {
+      final originalImage = img.decodeImage(bytes);
 
-    if (originalImage == null) {
+      if (originalImage == null) {
+        setState(() {
+          imageBase64 = base64Encode(bytes);
+        });
+        return;
+      }
+
+      // Додатково зменшуємо фото.
+      final resizedImage = img.copyResize(
+        originalImage,
+        width: originalImage.width > 1000 ? 1000 : originalImage.width,
+      );
+
+      // Зберігаємо як JPEG із якістю 70%.
+      final compressedBytes = img.encodeJpg(resizedImage, quality: 70);
+
+      setState(() {
+        imageBase64 = base64Encode(compressedBytes);
+      });
+    } catch (_) {
+      // Якщо стиснення не вдалося —
+      // зберігаємо оригінальне фото.
       setState(() {
         imageBase64 = base64Encode(bytes);
       });
-      return;
     }
-
-    // Додатково зменшуємо фото.
-    final resizedImage = img.copyResize(
-      originalImage,
-      width: originalImage.width > 1000
-          ? 1000
-          : originalImage.width,
-    );
-
-    // Зберігаємо як JPEG із якістю 70%.
-    final compressedBytes = img.encodeJpg(
-      resizedImage,
-      quality: 70,
-    );
-
-    setState(() {
-      imageBase64 = base64Encode(compressedBytes);
-    });
-  } catch (_) {
-    // Якщо стиснення не вдалося —
-    // зберігаємо оригінальне фото.
-    setState(() {
-      imageBase64 = base64Encode(bytes);
-    });
   }
-}
 
   Future<void> pickDate() async {
-    final date =
-        await showDatePicker(
-      context:
-          context,
-      initialDate:
-          selectedDate,
-      firstDate:
-          DateTime(2000),
-      lastDate:
-          DateTime.now(),
+    final date = await showDatePicker(
+      context: context,
+      initialDate: selectedDate,
+      firstDate: DateTime(2000),
+      lastDate: DateTime.now(),
     );
 
-    if (date != null) {
+    if (date != null && mounted) {
       setState(() {
-        selectedDate =
-            date;
+        selectedDate = date;
       });
     }
   }
@@ -1752,29 +1520,21 @@ class _AddTreePageState
       Uint8List bytes;
 
       if (imageBase64 != null) {
-        bytes =
-            base64Decode(
-          imageBase64!,
-        );
+        bytes = base64Decode(imageBase64!);
       } else {
-        final XFile? image =
-            await picker.pickImage(
-          source:
-              ImageSource.gallery,
-          imageQuality:
-              80,
-          maxWidth:
-              1200,
+        final XFile? image = await picker.pickImage(
+          source: ImageSource.gallery,
+          imageQuality: 80,
+          maxWidth: 1200,
         );
 
         if (image == null) return;
 
-        bytes =
-            await image.readAsBytes();
+        bytes = await image.readAsBytes();
+        if (!mounted) return;
 
         setState(() {
-          imageBase64 =
-              base64Encode(bytes);
+          imageBase64 = base64Encode(bytes);
         });
       }
 
@@ -1782,10 +1542,7 @@ class _AddTreePageState
         identifying = true;
       });
 
-      final results =
-          await PlantNetApi.identify(
-        bytes,
-      );
+      final results = await PlantNetApi.identify(bytes);
 
       if (!mounted) return;
 
@@ -1794,15 +1551,8 @@ class _AddTreePageState
       });
 
       if (results.isEmpty) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(
-          const SnackBar(
-            content:
-                Text(
-              'Pl@ntNet не зміг визначити дерево 😕',
-            ),
-          ),
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Pl@ntNet не зміг визначити дерево 😕')),
         );
         return;
       }
@@ -1815,18 +1565,10 @@ class _AddTreePageState
         identifying = false;
       });
 
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(
+      ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content:
-              Text(
-            'Помилка визначення:\n$e',
-          ),
-          duration:
-              const Duration(
-            seconds: 7,
-          ),
+          content: Text('Помилка визначення:\n$e'),
+          duration: const Duration(seconds: 7),
         ),
       );
     }
@@ -1837,39 +1579,26 @@ class _AddTreePageState
     BuildContext sheetContext,
   ) async {
     setState(() {
-      selectedTreeType =
-          result.name;
+      selectedTreeType = result.name;
 
       loadingFacts = true;
 
-      factsController.text =
-          '🔎 Шукаю цікаві факти про ${result.name}...';
+      factsController.text = '🔎 Шукаю цікаві факти про ${result.name}...';
     });
 
     Navigator.pop(sheetContext);
 
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(
+    ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content:
-            Text(
-          'Вибрано: ${result.name} 🌳',
-        ),
-        duration:
-            const Duration(
-          seconds: 2,
-        ),
+        content: Text('Вибрано: ${result.name} 🌳'),
+        duration: const Duration(seconds: 2),
       ),
     );
 
     try {
-      final factsResult =
-          await TreeFactsApi.getFacts(
-        commonName:
-            result.name,
-        scientificName:
-            result.scientificName,
+      final factsResult = await TreeFactsApi.getFacts(
+        commonName: result.name,
+        scientificName: result.scientificName,
       );
 
       if (!mounted) return;
@@ -1878,8 +1607,7 @@ class _AddTreePageState
         loadingFacts = false;
 
         if (factsResult != null) {
-          factsController.text =
-              factsResult.facts;
+          factsController.text = factsResult.facts;
         } else {
           factsController.text =
               'Не вдалося автоматично знайти факти про цей вид.\n\n'
@@ -1898,128 +1626,61 @@ class _AddTreePageState
     }
   }
 
-  void showPlantNetResults(
-    List<PlantNetResult> results,
-  ) {
+  void showPlantNetResults(List<PlantNetResult> results) {
     showModalBottomSheet(
-      context:
-          context,
-      isScrollControlled:
-          true,
-      builder:
-          (sheetContext) {
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) {
         return SafeArea(
-          child:
-              Padding(
-            padding:
-                const EdgeInsets.all(
-              20,
-            ),
-            child:
-                SingleChildScrollView(
-              child:
-                  Column(
-                mainAxisSize:
-                    MainAxisSize.min,
-                crossAxisAlignment:
-                    CrossAxisAlignment.start,
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
                     '🤖 Результат AI',
-                    style:
-                        TextStyle(
-                      fontSize:
-                          24,
-                      fontWeight:
-                          FontWeight.bold,
-                    ),
+                    style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
                   ),
 
-                  const SizedBox(
-                    height:
-                        8,
-                  ),
+                  const SizedBox(height: 8),
 
-                  const Text(
-                    'Ось найімовірніші варіанти:',
-                  ),
+                  const Text('Ось найімовірніші варіанти:'),
 
-                  const SizedBox(
-                    height:
-                        16,
-                  ),
+                  const SizedBox(height: 16),
 
-                  ...results.map(
-                    (result) {
-                      final percent =
-                          (result.score * 100)
-                              .round();
+                  ...results.map((result) {
+                    final percent = (result.score * 100).round();
 
-                      return Card(
-                        margin:
-                            const EdgeInsets.only(
-                          bottom:
-                              10,
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 10),
+                      child: ListTile(
+                        leading: CircleAvatar(
+                          backgroundColor: Colors.green.shade100,
+                          child: const Icon(Icons.eco, color: Colors.green),
                         ),
-                        child:
-                            ListTile(
-                          leading:
-                              CircleAvatar(
-                            backgroundColor:
-                                Colors.green.shade100,
-                            child:
-                                const Icon(
-                              Icons.eco,
-                              color:
-                                  Colors.green,
-                            ),
-                          ),
-                          title:
-                              Text(
-                            result.name,
-                            style:
-                                const TextStyle(
-                              fontWeight:
-                                  FontWeight.bold,
-                            ),
-                          ),
-                          subtitle:
-                              Text(
-                            result.scientificName,
-                          ),
-                          trailing:
-                              Text(
-                            '$percent%',
-                            style:
-                                const TextStyle(
-                              fontWeight:
-                                  FontWeight.bold,
-                            ),
-                          ),
-                          onTap:
-                              () {
-                            selectPlantNetResult(
-                              result,
-                              sheetContext,
-                            );
-                          },
+                        title: Text(
+                          result.name,
+                          style: const TextStyle(fontWeight: FontWeight.bold),
                         ),
-                      );
-                    },
-                  ),
+                        subtitle: Text(result.scientificName),
+                        trailing: Text(
+                          '$percent%',
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        onTap: () {
+                          selectPlantNetResult(result, sheetContext);
+                        },
+                      ),
+                    );
+                  }),
 
-                  const SizedBox(
-                    height:
-                        8,
-                  ),
+                  const SizedBox(height: 8),
 
                   const Text(
                     '💡 AI може помилятися. Перед збереженням перевір результат.',
-                    style:
-                        TextStyle(
-                      color:
-                          Colors.grey,
-                    ),
+                    style: TextStyle(color: Colors.grey),
                   ),
                 ],
               ),
@@ -2035,63 +1696,32 @@ class _AddTreePageState
   // ==========================================================
 
   Future<void> selectOtherTree() async {
-    final controller =
-        TextEditingController();
+    final controller = TextEditingController();
 
-    final result =
-        await showDialog<String>(
-      context:
-          context,
-      builder:
-          (context) {
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
         return AlertDialog(
-          title:
-              const Text(
-            'Інший вид дерева',
-          ),
-          content:
-              TextField(
-            controller:
-                controller,
-            autofocus:
-                true,
-            decoration:
-                const InputDecoration(
-              hintText:
-                  'Наприклад: Каштан',
-            ),
+          title: const Text('Інший вид дерева'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'Наприклад: Каштан'),
           ),
           actions: [
             TextButton(
-              onPressed:
-                  () =>
-                      Navigator.pop(
-                context,
-              ),
-              child:
-                  const Text(
-                'Скасувати',
-              ),
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Скасувати'),
             ),
             FilledButton(
-              onPressed:
-                  () {
-                final text =
-                    controller
-                        .text
-                        .trim();
+              onPressed: () {
+                final text = controller.text.trim();
 
                 if (text.isNotEmpty) {
-                  Navigator.pop(
-                    context,
-                    text,
-                  );
+                  Navigator.pop(context, text);
                 }
               },
-              child:
-                  const Text(
-                'Додати',
-              ),
+              child: const Text('Додати'),
             ),
           ],
         );
@@ -2100,11 +1730,9 @@ class _AddTreePageState
 
     controller.dispose();
 
-    if (result != null &&
-        result.isNotEmpty) {
+    if (mounted && result != null && result.isNotEmpty) {
       setState(() {
-        selectedTreeType =
-            result;
+        selectedTreeType = result;
       });
     }
   }
@@ -2114,66 +1742,32 @@ class _AddTreePageState
   // ==========================================================
 
   Future<void> selectOtherLocation() async {
-    final controller =
-        TextEditingController(
-      text:
-          selectedLocation ?? '',
-    );
+    final controller = TextEditingController(text: selectedLocation ?? '');
 
-    final result =
-        await showDialog<String>(
-      context:
-          context,
-      builder:
-          (context) {
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
         return AlertDialog(
-          title:
-              const Text(
-            'Інша локація',
-          ),
-          content:
-              TextField(
-            controller:
-                controller,
-            autofocus:
-                true,
-            decoration:
-                const InputDecoration(
-              hintText:
-                  'Наприклад: Деражня',
-            ),
+          title: const Text('Інша локація'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: 'Наприклад: Деражня'),
           ),
           actions: [
             TextButton(
-              onPressed:
-                  () =>
-                      Navigator.pop(
-                context,
-              ),
-              child:
-                  const Text(
-                'Скасувати',
-              ),
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Скасувати'),
             ),
             FilledButton(
-              onPressed:
-                  () {
-                final text =
-                    controller
-                        .text
-                        .trim();
+              onPressed: () {
+                final text = controller.text.trim();
 
                 if (text.isNotEmpty) {
-                  Navigator.pop(
-                    context,
-                    text,
-                  );
+                  Navigator.pop(context, text);
                 }
               },
-              child:
-                  const Text(
-                'Додати',
-              ),
+              child: const Text('Додати'),
             ),
           ],
         );
@@ -2182,14 +1776,11 @@ class _AddTreePageState
 
     controller.dispose();
 
-    if (result != null &&
-        result.isNotEmpty) {
+    if (mounted && result != null && result.isNotEmpty) {
       setState(() {
-        selectedLocation =
-            result;
+        selectedLocation = result;
 
-        locationController.text =
-            result;
+        locationController.text = result;
       });
     }
   }
@@ -2198,66 +1789,41 @@ class _AddTreePageState
   // SAVE
   // ==========================================================
 
-  void saveTree() {
-    if (selectedTreeType == null ||
-        selectedTreeType!.trim().isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(
-        const SnackBar(
-          content:
-              Text(
-            'Вибери або визнач вид дерева 🌳',
-          ),
-        ),
+  Future<void> saveTree() async {
+    if (saving || loadingFacts || identifying) return;
+    if (selectedTreeType == null || selectedTreeType!.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Вибери або визнач вид дерева 🌳')),
       );
       return;
     }
 
-    final location =
-        locationController.text.trim();
+    final location = locationController.text.trim();
 
     if (location.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(
-        const SnackBar(
-          content:
-              Text(
-            'Вкажи локацію 📍',
-          ),
-        ),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Вкажи локацію 📍')));
       return;
     }
 
     final tree = Tree(
-      type:
-          selectedTreeType!,
-      location:
-          location,
-      locationType:
-          selectedLocationType,
-      facts:
-          factsController.text.trim(),
-      notes:
-          notesController.text.trim(),
-      imageBase64:
-          imageBase64,
-      dateFound:
-          selectedDate,
-      foundTogether:
-          foundTogether,
-      isRare:
-          isRare,
+      type: selectedTreeType!,
+      location: location,
+      locationType: selectedLocationType,
+      facts: factsController.text.trim(),
+      notes: notesController.text.trim(),
+      imageBase64: imageBase64,
+      dateFound: selectedDate,
+      foundTogether: foundTogether,
+      isRare: isRare,
     );
 
-    Navigator.pop(
-      context,
-      TreeAction(
-        tree: tree,
-      ),
-    );
+    final action = TreeAction(tree: tree);
+    setState(() => saving = true);
+    final saved = await widget.onSave(action);
+    if (!mounted) return;
+    setState(() => saving = false);
+    if (saved) Navigator.pop(context, action);
   }
 
   // ==========================================================
@@ -2265,59 +1831,37 @@ class _AddTreePageState
   // ==========================================================
 
   Future<void> deleteTree() async {
-    final confirmed =
-        await showDialog<bool>(
-      context:
-          context,
-      builder:
-          (context) {
+    if (saving) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
         return AlertDialog(
-          title:
-              const Text(
-            'Видалити дерево?',
-          ),
-          content:
-              Text(
+          title: const Text('Видалити дерево?'),
+          content: Text(
             'Ти точно хочеш видалити '
             '«${widget.tree?.type}»?',
           ),
           actions: [
             TextButton(
-              onPressed:
-                  () =>
-                      Navigator.pop(
-                context,
-                false,
-              ),
-              child:
-                  const Text(
-                'Скасувати',
-              ),
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Скасувати'),
             ),
             FilledButton(
-              onPressed:
-                  () =>
-                      Navigator.pop(
-                context,
-                true,
-              ),
-              child:
-                  const Text(
-                'Видалити',
-              ),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Видалити'),
             ),
           ],
         );
       },
     );
 
-    if (confirmed == true) {
-      Navigator.pop(
-        context,
-        TreeAction(
-          deleted: true,
-        ),
-      );
+    if (confirmed == true && mounted) {
+      final action = TreeAction(deleted: true);
+      setState(() => saving = true);
+      final saved = await widget.onSave(action);
+      if (!mounted) return;
+      setState(() => saving = false);
+      if (saved) Navigator.pop(context, action);
     }
   }
 
@@ -2328,136 +1872,74 @@ class _AddTreePageState
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar:
-          AppBar(
-        title:
-            Text(
-          isEditing
-              ? 'Редагувати дерево'
-              : 'Нове дерево',
-        ),
+      appBar: AppBar(
+        title: Text(isEditing ? 'Редагувати дерево' : 'Нове дерево'),
         actions: [
           if (isEditing)
             IconButton(
-              onPressed:
-                  deleteTree,
-              icon:
-                  const Icon(
-                Icons.delete_outline,
-              ),
+              onPressed: saving ? null : deleteTree,
+              icon: const Icon(Icons.delete_outline),
             ),
         ],
       ),
-      body:
-          SingleChildScrollView(
-        padding:
-            const EdgeInsets.all(16),
-        child:
-            Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.stretch,
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             GestureDetector(
-              onTap:
-                  pickImage,
-              child:
-                  ClipRRect(
-                borderRadius:
-                    BorderRadius.circular(18),
-                child:
-                    imageBase64 != null
-                        ? Image.memory(
-                            base64Decode(
-                              imageBase64!,
+              onTap: pickImage,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(18),
+                child: imageBase64 != null
+                    ? Image.memory(
+                        base64Decode(imageBase64!),
+                        height: 230,
+                        fit: BoxFit.cover,
+                      )
+                    : Container(
+                        height: 230,
+                        decoration: BoxDecoration(
+                          color: Colors.green.shade50,
+                          border: Border.all(color: Colors.green.shade200),
+                          borderRadius: BorderRadius.circular(18),
+                        ),
+                        child: const Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.add_a_photo_outlined,
+                              size: 55,
+                              color: Colors.green,
                             ),
-                            height:
-                                230,
-                            fit:
-                                BoxFit.cover,
-                          )
-                        : Container(
-                            height:
-                                230,
-                            decoration:
-                                BoxDecoration(
-                              color:
-                                  Colors.green.shade50,
-                              border:
-                                  Border.all(
-                                color:
-                                    Colors.green.shade200,
-                              ),
-                              borderRadius:
-                                  BorderRadius.circular(
-                                18,
+                            SizedBox(height: 10),
+                            Text(
+                              'Додати фото',
+                              style: TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.w600,
                               ),
                             ),
-                            child:
-                                const Column(
-                              mainAxisAlignment:
-                                  MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  Icons
-                                      .add_a_photo_outlined,
-                                  size:
-                                      55,
-                                  color:
-                                      Colors.green,
-                                ),
-                                SizedBox(
-                                  height:
-                                      10,
-                                ),
-                                Text(
-                                  'Додати фото',
-                                  style:
-                                      TextStyle(
-                                    fontSize:
-                                        17,
-                                    fontWeight:
-                                        FontWeight.w600,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
+                          ],
+                        ),
+                      ),
               ),
             ),
 
-            const SizedBox(
-              height:
-                  12,
-            ),
+            const SizedBox(height: 12),
 
             SizedBox(
-              height:
-                  52,
-              child:
-                  OutlinedButton.icon(
-                onPressed:
-                    identifying ||
-                            loadingFacts
-                        ? null
-                        : identifyTree,
-                icon:
-                    identifying
-                        ? const SizedBox(
-                            width:
-                                20,
-                            height:
-                                20,
-                            child:
-                                CircularProgressIndicator(
-                              strokeWidth:
-                                  2,
-                            ),
-                          )
-                        : const Icon(
-                            Icons.auto_awesome,
-                          ),
-                label:
-                    Text(
+              height: 52,
+              child: OutlinedButton.icon(
+                onPressed: identifying || loadingFacts ? null : identifyTree,
+                icon: identifying
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.auto_awesome),
+                label: Text(
                   identifying
                       ? 'AI визначає дерево...'
                       : '🤖 Визначити дерево по фото',
@@ -2465,240 +1947,130 @@ class _AddTreePageState
               ),
             ),
 
-            const SizedBox(
-              height:
-                  20,
-            ),
+            const SizedBox(height: 20),
 
             DropdownButtonFormField<String>(
-              initialValue:
-                  selectedTreeType,
-              decoration:
-                  InputDecoration(
-                labelText:
-                    'Вид дерева',
-                prefixIcon:
-                    const Icon(
-                  Icons.eco,
-                ),
-                border:
-                    OutlineInputBorder(
-                  borderRadius:
-                      BorderRadius.circular(14),
+              initialValue: selectedTreeType,
+              decoration: InputDecoration(
+                labelText: 'Вид дерева',
+                prefixIcon: const Icon(Icons.eco),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
                 ),
               ),
-              items:
-                  typeItems.map(
-                (type) {
-                  return DropdownMenuItem<String>(
-                    value:
-                        type,
-                    child:
-                        Text(
-                      type,
-                    ),
-                  );
-                },
-              ).toList(),
-              onChanged:
-                  (value) async {
-                if (value ==
-                    'Інше...') {
+              items: typeItems.map((type) {
+                return DropdownMenuItem<String>(value: type, child: Text(type));
+              }).toList(),
+              onChanged: (value) async {
+                if (value == 'Інше...') {
                   await selectOtherTree();
                   return;
                 }
 
                 setState(() {
-                  selectedTreeType =
-                      value;
+                  selectedTreeType = value;
                 });
               },
             ),
 
-            const SizedBox(
-              height:
-                  16,
-            ),
+            const SizedBox(height: 16),
 
             DropdownButtonFormField<String>(
-              initialValue:
-                  selectedLocation,
-              decoration:
-                  InputDecoration(
-                labelText:
-                    'Локація',
-                prefixIcon:
-                    const Icon(
-                  Icons
-                      .location_on_outlined,
-                ),
-                border:
-                    OutlineInputBorder(
-                  borderRadius:
-                      BorderRadius.circular(14),
+              initialValue: selectedLocation,
+              decoration: InputDecoration(
+                labelText: 'Локація',
+                prefixIcon: const Icon(Icons.location_on_outlined),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
                 ),
               ),
-              items:
-                  locationItems.map(
-                (location) {
-                  return DropdownMenuItem<String>(
-                    value:
-                        location,
-                    child:
-                        Text(
-                      location,
-                    ),
-                  );
-                },
-              ).toList(),
-              onChanged:
-                  (value) async {
-                if (value ==
-                    'Інше...') {
+              items: locationItems.map((location) {
+                return DropdownMenuItem<String>(
+                  value: location,
+                  child: Text(location),
+                );
+              }).toList(),
+              onChanged: (value) async {
+                if (value == 'Інше...') {
                   await selectOtherLocation();
                   return;
                 }
 
                 setState(() {
-                  selectedLocation =
-                      value;
+                  selectedLocation = value;
 
-                  locationController.text =
-                      value ?? '';
+                  locationController.text = value ?? '';
                 });
               },
             ),
 
-            const SizedBox(
-              height:
-                  16,
-            ),
+            const SizedBox(height: 16),
 
             DropdownButtonFormField<String>(
-              initialValue:
-                  selectedLocationType,
-              decoration:
-                  InputDecoration(
-                labelText:
-                    'Тип локації',
-                prefixIcon:
-                    const Icon(
-                  Icons.category_outlined,
-                ),
-                border:
-                    OutlineInputBorder(
-                  borderRadius:
-                      BorderRadius.circular(14),
+              initialValue: selectedLocationType,
+              decoration: InputDecoration(
+                labelText: 'Тип локації',
+                prefixIcon: const Icon(Icons.category_outlined),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
                 ),
               ),
-              items:
-                  locationTypes.map(
-                (type) {
-                  return DropdownMenuItem<String>(
-                    value:
-                        type,
-                    child:
-                        Text(
-                      type,
-                    ),
-                  );
-                },
-              ).toList(),
-              onChanged:
-                  (value) {
+              items: locationTypes.map((type) {
+                return DropdownMenuItem<String>(value: type, child: Text(type));
+              }).toList(),
+              onChanged: (value) {
                 if (value == null) return;
 
                 setState(() {
-                  selectedLocationType =
-                      value;
+                  selectedLocationType = value;
                 });
               },
             ),
 
-            const SizedBox(
-              height:
-                  10,
-            ),
+            const SizedBox(height: 10),
 
             Card(
-              child:
-                  SwitchListTile(
-                value:
-                    foundTogether,
-                onChanged:
-                    (value) {
+              child: SwitchListTile(
+                value: foundTogether,
+                onChanged: (value) {
                   setState(() {
-                    foundTogether =
-                        value;
+                    foundTogether = value;
                   });
                 },
-                title:
-                    const Text(
-                  '❤️ Знайдено разом',
-                ),
-                subtitle:
-                    const Text(
-                  'Ви фотографували дерево разом',
-                ),
+                title: const Text('❤️ Знайдено разом'),
+                subtitle: const Text('Ви фотографували дерево разом'),
               ),
             ),
 
-            const SizedBox(
-              height:
-                  4,
-            ),
+            const SizedBox(height: 4),
 
             Card(
-              child:
-                  SwitchListTile(
-                value:
-                    isRare,
-                onChanged:
-                    (value) {
+              child: SwitchListTile(
+                value: isRare,
+                onChanged: (value) {
                   setState(() {
-                    isRare =
-                        value;
+                    isRare = value;
                   });
                 },
-                title:
-                    const Text(
-                  '⭐ Рідкісний вид',
-                ),
-                subtitle:
-                    const Text(
-                  'Поки що можна позначати вручну',
-                ),
+                title: const Text('⭐ Рідкісний вид'),
+                subtitle: const Text('Поки що можна позначати вручну'),
               ),
             ),
 
-            const SizedBox(
-              height:
-                  10,
-            ),
+            const SizedBox(height: 10),
 
             InkWell(
-              onTap:
-                  pickDate,
-              borderRadius:
-                  BorderRadius.circular(14),
-              child:
-                  InputDecorator(
-                decoration:
-                    InputDecoration(
-                  labelText:
-                      'Дата знаходження',
-                  prefixIcon:
-                      const Icon(
-                        Icons.calendar_month,
-                      ),
-                  border:
-                      OutlineInputBorder(
-                    borderRadius:
-                        BorderRadius.circular(14),
+              onTap: pickDate,
+              borderRadius: BorderRadius.circular(14),
+              child: InputDecorator(
+                decoration: InputDecoration(
+                  labelText: 'Дата знаходження',
+                  prefixIcon: const Icon(Icons.calendar_month),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
                   ),
                 ),
-                child:
-                    Text(
+                child: Text(
                   '${selectedDate.day.toString().padLeft(2, '0')}.'
                   '${selectedDate.month.toString().padLeft(2, '0')}.'
                   '${selectedDate.year}',
@@ -2706,132 +2078,74 @@ class _AddTreePageState
               ),
             ),
 
-            const SizedBox(
-              height:
-                  16,
-            ),
+            const SizedBox(height: 16),
 
             TextField(
-              controller:
-                  factsController,
-              maxLines:
-                  6,
-              decoration:
-                  InputDecoration(
-                labelText:
-                    '📚 Цікаві факти',
-                hintText:
-                    'Після визначення дерева факти з’являться тут автоматично...',
-                prefixIcon:
-                    const Icon(
-                  Icons.menu_book_outlined,
-                ),
-                suffixIcon:
-                    loadingFacts
-                        ? const Padding(
-                            padding:
-                                EdgeInsets.all(
-                              14,
-                            ),
-                            child:
-                                CircularProgressIndicator(
-                              strokeWidth:
-                                  2,
-                            ),
-                          )
-                        : null,
-                border:
-                    OutlineInputBorder(
-                  borderRadius:
-                      BorderRadius.circular(14),
+              controller: factsController,
+              maxLines: 6,
+              decoration: InputDecoration(
+                labelText: '📚 Цікаві факти',
+                hintText: 'Після визначення дерева факти з’являться тут автоматично...',
+                prefixIcon: const Icon(Icons.menu_book_outlined),
+                suffixIcon: loadingFacts
+                    ? const Padding(
+                        padding: EdgeInsets.all(14),
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : null,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
                 ),
               ),
             ),
 
             if (loadingFacts)
               const Padding(
-                padding:
-                    EdgeInsets.only(
-                  top:
-                      8,
-                ),
-                child:
-                    Text(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(
                   '🤖 Шукаємо інформацію про цей вид...',
-                  style:
-                      TextStyle(
-                    color:
-                        Colors.green,
-                    fontWeight:
-                        FontWeight.w600,
+                  style: TextStyle(
+                    color: Colors.green,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
               ),
 
-            const SizedBox(
-              height:
-                  18,
-            ),
+            const SizedBox(height: 18),
 
             TextField(
-              controller:
-                  notesController,
-              maxLines:
-                  5,
-              decoration:
-                  InputDecoration(
-                labelText:
-                    '❤️ Наша історія',
-                hintText:
-                    'Наприклад: Знайшли, гуляючи після роботи. Маша першою його помітила 😄',
-                prefixIcon:
-                    const Icon(
-                  Icons.favorite_border,
-                ),
-                border:
-                    OutlineInputBorder(
-                  borderRadius:
-                      BorderRadius.circular(14),
+              controller: notesController,
+              maxLines: 5,
+              decoration: InputDecoration(
+                labelText: '❤️ Наша історія',
+                hintText: 'Наприклад: Знайшли, гуляючи після роботи. Маша першою його помітила 😄',
+                prefixIcon: const Icon(Icons.favorite_border),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
                 ),
               ),
             ),
 
-            const SizedBox(
-              height:
-                  25,
-            ),
+            const SizedBox(height: 25),
 
             SizedBox(
-              height:
-                  55,
-              child:
-                  FilledButton.icon(
-                onPressed:
-                    saveTree,
-                icon:
-                    const Icon(
-                  Icons.save,
-                ),
-                label:
-                    Text(
-                  isEditing
-                      ? 'Зберегти зміни'
-                      : 'Додати дерево',
-                  style:
-                      const TextStyle(
-                    fontSize:
-                        17,
-                    fontWeight:
-                        FontWeight.bold,
+              height: 55,
+              child: FilledButton.icon(
+                onPressed: saving || loadingFacts || identifying
+                    ? null
+                    : saveTree,
+                icon: const Icon(Icons.save),
+                label: Text(
+                  isEditing ? 'Зберегти зміни' : 'Додати дерево',
+                  style: const TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
                   ),
                 ),
               ),
             ),
 
-            const SizedBox(
-              height:
-                  30,
-            ),
+            const SizedBox(height: 30),
           ],
         ),
       ),
@@ -2843,330 +2157,168 @@ class _AddTreePageState
 // TREE DETAILS
 // ============================================================
 
-class TreeDetailsPage
-    extends StatelessWidget {
+class TreeDetailsPage extends StatelessWidget {
   final Tree tree;
+  final TreeSaveCallback onSave;
 
-  const TreeDetailsPage({
-    super.key,
-    required this.tree,
-  });
+  const TreeDetailsPage({super.key, required this.tree, required this.onSave});
 
-  Future<void> editTree(
-    BuildContext context,
-  ) async {
-    final result =
-        await Navigator.push<TreeAction>(
+  Future<void> editTree(BuildContext context) async {
+    final result = await Navigator.push<TreeAction>(
       context,
       MaterialPageRoute(
-        builder: (_) =>
-            AddTreePage(
-          tree:
-              tree,
-        ),
+        builder: (_) => AddTreePage(tree: tree, onSave: onSave),
       ),
     );
 
-    if (result != null) {
-      Navigator.pop(
-        context,
-        result,
-      );
+    if (result != null && context.mounted) {
+      Navigator.pop(context, result);
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar:
-          AppBar(
-        title:
-            const Text(
-          'Дерево',
-        ),
+      appBar: AppBar(
+        title: const Text('Дерево'),
         actions: [
           IconButton(
-            icon:
-                const Icon(
-              Icons.edit,
-            ),
-            onPressed:
-                () =>
-                    editTree(context),
+            icon: const Icon(Icons.edit),
+            onPressed: () => editTree(context),
           ),
         ],
       ),
-      body:
-          SingleChildScrollView(
-        child:
-            Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.start,
+      body: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            if (tree.imageBase64 !=
-                null)
+            if (tree.imageBase64 != null)
               Image.memory(
-                base64Decode(
-                  tree.imageBase64!,
-                ),
-                width:
-                    double.infinity,
-                height:
-                    300,
-                fit:
-                    BoxFit.cover,
+                base64Decode(tree.imageBase64!),
+                width: double.infinity,
+                height: 300,
+                fit: BoxFit.cover,
               )
             else
               Container(
-                width:
-                    double.infinity,
-                height:
-                    300,
-                color:
-                    Colors.green.shade100,
-                child:
-                    const Icon(
-                  Icons.park,
-                  size:
-                      100,
-                  color:
-                      Colors.green,
-                ),
+                width: double.infinity,
+                height: 300,
+                color: Colors.green.shade100,
+                child: const Icon(Icons.park, size: 100, color: Colors.green),
               ),
 
             Padding(
-              padding:
-                  const EdgeInsets.all(
-                20,
-              ),
-              child:
-                  Column(
-                crossAxisAlignment:
-                    CrossAxisAlignment.start,
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Row(
                     children: [
                       Expanded(
-                        child:
-                            Text(
+                        child: Text(
                           tree.type,
-                          style:
-                              const TextStyle(
-                            fontSize:
-                                30,
-                            fontWeight:
-                                FontWeight.bold,
+                          style: const TextStyle(
+                            fontSize: 30,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
                       ),
                       if (tree.isRare)
-                        const Icon(
-                          Icons.star,
-                          color:
-                              Colors.amber,
-                          size:
-                              30,
-                        ),
+                        const Icon(Icons.star, color: Colors.amber, size: 30),
                     ],
                   ),
 
-                  const SizedBox(
-                    height:
-                        15,
-                  ),
+                  const SizedBox(height: 15),
 
                   Row(
                     children: [
-                      const Icon(
-                        Icons.location_on,
-                        color:
-                            Colors.green,
-                      ),
-                      const SizedBox(
-                        width:
-                            8,
-                      ),
+                      const Icon(Icons.location_on, color: Colors.green),
+                      const SizedBox(width: 8),
                       Expanded(
-                        child:
-                            Text(
+                        child: Text(
                           tree.location,
-                          style:
-                              const TextStyle(
-                            fontSize:
-                                17,
-                          ),
+                          style: const TextStyle(fontSize: 17),
                         ),
                       ),
                     ],
                   ),
 
-                  const SizedBox(
-                    height:
-                        6,
-                  ),
+                  const SizedBox(height: 6),
 
                   Text(
                     'Тип локації: ${tree.locationType}',
-                    style:
-                        const TextStyle(
-                      color:
-                          Colors.grey,
-                    ),
+                    style: const TextStyle(color: Colors.grey),
                   ),
 
-                  const SizedBox(
-                    height:
-                        12,
-                  ),
+                  const SizedBox(height: 12),
 
                   Row(
                     children: [
-                      const Icon(
-                        Icons.calendar_month,
-                        color:
-                            Colors.green,
-                      ),
-                      const SizedBox(
-                        width:
-                            8,
-                      ),
+                      const Icon(Icons.calendar_month, color: Colors.green),
+                      const SizedBox(width: 8),
                       Text(
                         '${tree.dateFound.day.toString().padLeft(2, '0')}.'
                         '${tree.dateFound.month.toString().padLeft(2, '0')}.'
                         '${tree.dateFound.year}',
-                        style:
-                            const TextStyle(
-                          fontSize:
-                              17,
-                        ),
+                        style: const TextStyle(fontSize: 17),
                       ),
                     ],
                   ),
 
                   if (tree.foundTogether)
                     const Padding(
-                      padding:
-                          EdgeInsets.only(
-                        top:
-                            12,
-                      ),
-                      child:
-                          Chip(
-                        avatar:
-                            Icon(
-                          Icons.favorite,
-                          size:
-                              17,
-                        ),
-                        label:
-                            Text(
-                          'Знайдено разом ❤️',
-                        ),
+                      padding: EdgeInsets.only(top: 12),
+                      child: Chip(
+                        avatar: Icon(Icons.favorite, size: 17),
+                        label: Text('Знайдено разом ❤️'),
                       ),
                     ),
 
-                  const SizedBox(
-                    height:
-                        25,
-                  ),
+                  const SizedBox(height: 25),
 
                   const Text(
                     '📚 Цікаві факти',
-                    style:
-                        TextStyle(
-                      fontSize:
-                          21,
-                      fontWeight:
-                          FontWeight.bold,
-                    ),
+                    style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
                   ),
 
-                  const SizedBox(
-                    height:
-                        8,
-                  ),
+                  const SizedBox(height: 8),
 
                   Container(
-                    width:
-                        double.infinity,
-                    padding:
-                        const EdgeInsets.all(
-                      16,
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade50,
+                      borderRadius: BorderRadius.circular(16),
                     ),
-                    decoration:
-                        BoxDecoration(
-                      color:
-                          Colors.green.shade50,
-                      borderRadius:
-                          BorderRadius.circular(
-                        16,
-                      ),
-                    ),
-                    child:
-                        Text(
-                      tree.facts.isEmpty
-                          ? 'Фактів поки немає.'
-                          : tree.facts,
-                      style:
-                          const TextStyle(
-                        fontSize:
-                            17,
-                        height:
-                            1.5,
-                      ),
+                    child: Text(
+                      tree.facts.isEmpty ? 'Фактів поки немає.' : tree.facts,
+                      style: const TextStyle(fontSize: 17, height: 1.5),
                     ),
                   ),
 
-                  if (tree.notes
-                      .trim()
-                      .isNotEmpty) ...[
-                    const SizedBox(
-                      height:
-                          28,
-                    ),
+                  if (tree.notes.trim().isNotEmpty) ...[
+                    const SizedBox(height: 28),
 
                     const Text(
                       '❤️ Наша історія',
-                      style:
-                          TextStyle(
-                        fontSize:
-                            21,
-                        fontWeight:
-                            FontWeight.bold,
+                      style: TextStyle(
+                        fontSize: 21,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
 
-                    const SizedBox(
-                      height:
-                          8,
-                    ),
+                    const SizedBox(height: 8),
 
                     Container(
-                      width:
-                          double.infinity,
-                      padding:
-                          const EdgeInsets.all(
-                        16,
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.pink.shade50,
+                        borderRadius: BorderRadius.circular(16),
                       ),
-                      decoration:
-                          BoxDecoration(
-                        color:
-                            Colors.pink.shade50,
-                        borderRadius:
-                            BorderRadius.circular(
-                          16,
-                        ),
-                      ),
-                      child:
-                          Text(
+                      child: Text(
                         tree.notes,
-                        style:
-                            const TextStyle(
-                          fontSize:
-                              17,
-                          height:
-                              1.5,
-                        ),
+                        style: const TextStyle(fontSize: 17, height: 1.5),
                       ),
                     ),
                   ],
@@ -3187,10 +2339,7 @@ class TreeDetailsPage
 class MapPage extends StatefulWidget {
   final List<Tree> trees;
 
-  const MapPage({
-    super.key,
-    required this.trees,
-  });
+  const MapPage({super.key, required this.trees});
 
   @override
   State<MapPage> createState() => _MapPageState();
@@ -3200,6 +2349,10 @@ class _MapPageState extends State<MapPage> {
   final Map<String, LatLng> coordinatesCache = {};
 
   bool loading = true;
+  bool coordinatesReady = false;
+  bool findingCoordinates = false;
+  bool refreshRequested = false;
+  Set<String> knownLocations = {};
 
   // ============================================================
   // КООРДИНАТИ ВІДОМИХ МІСТ
@@ -3294,7 +2447,45 @@ class _MapPageState extends State<MapPage> {
   @override
   void initState() {
     super.initState();
+    knownLocations = currentLocations;
     loadCoordinates();
+  }
+
+  Set<String> get currentLocations => widget.trees
+      .map((tree) => normalizeLocation(tree.location))
+      .where((location) => location.isNotEmpty)
+      .toSet();
+
+  @override
+  void didUpdateWidget(covariant MapPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final locations = currentLocations;
+    if (locations.length != knownLocations.length ||
+        !locations.containsAll(knownLocations)) {
+      knownLocations = locations;
+      refreshRequested = true;
+      if (coordinatesReady) {
+        loading = true;
+        refreshCoordinates();
+      }
+    }
+  }
+
+  Future<void> refreshCoordinates() async {
+    if (findingCoordinates) {
+      refreshRequested = true;
+      return;
+    }
+    findingCoordinates = true;
+    try {
+      do {
+        refreshRequested = false;
+        await findMissingCoordinates();
+      } while (mounted && refreshRequested);
+    } finally {
+      findingCoordinates = false;
+      if (mounted) setState(() => loading = false);
+    }
   }
 
   // ============================================================
@@ -3302,41 +2493,41 @@ class _MapPageState extends State<MapPage> {
   // ============================================================
 
   Future<void> loadCoordinates() async {
-    final prefs = await SharedPreferences.getInstance();
+    try {
+      final prefs = await SharedPreferences.getInstance();
 
-    final cached = prefs.getString('map_coordinates');
+      final cached = prefs.getString('map_coordinates');
 
-    if (cached != null && cached.isNotEmpty) {
-      try {
-        final decoded = jsonDecode(cached);
+      if (cached != null && cached.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(cached);
 
-        if (decoded is Map) {
-          for (final entry in decoded.entries) {
-            try {
-              final value = entry.value;
+          if (decoded is Map) {
+            for (final entry in decoded.entries) {
+              try {
+                final value = entry.value;
 
-              if (value is Map &&
-                  value['lat'] != null &&
-                  value['lng'] != null) {
-                coordinatesCache[
-                    normalizeLocation(entry.key.toString())] = LatLng(
-                  (value['lat'] as num).toDouble(),
-                  (value['lng'] as num).toDouble(),
-                );
-              }
-            } catch (_) {}
+                if (value is Map &&
+                    value['lat'] != null &&
+                    value['lng'] != null) {
+                  coordinatesCache[normalizeLocation(
+                    entry.key.toString(),
+                  )] = LatLng(
+                    (value['lat'] as num).toDouble(),
+                    (value['lng'] as num).toDouble(),
+                  );
+                }
+              } catch (_) {}
+            }
           }
-        }
-      } catch (_) {}
+        } catch (_) {}
+      }
+    } catch (_) {
+      // A missing or unreadable cache must not prevent the map from loading.
     }
-
-    await findMissingCoordinates();
-
     if (!mounted) return;
-
-    setState(() {
-      loading = false;
-    });
+    coordinatesReady = true;
+    await refreshCoordinates();
   }
 
   // ============================================================
@@ -3344,21 +2535,22 @@ class _MapPageState extends State<MapPage> {
   // ============================================================
 
   Future<void> saveCoordinates() async {
-    final prefs = await SharedPreferences.getInstance();
+    try {
+      final prefs = await SharedPreferences.getInstance();
 
-    final Map<String, dynamic> data = {};
+      final Map<String, dynamic> data = {};
 
-    for (final entry in coordinatesCache.entries) {
-      data[entry.key] = {
-        'lat': entry.value.latitude,
-        'lng': entry.value.longitude,
-      };
+      for (final entry in coordinatesCache.entries) {
+        data[entry.key] = {
+          'lat': entry.value.latitude,
+          'lng': entry.value.longitude,
+        };
+      }
+
+      await prefs.setString('map_coordinates', jsonEncode(data));
+    } catch (_) {
+      // Coordinates can be fetched again; keep the map usable if storage is full.
     }
-
-    await prefs.setString(
-      'map_coordinates',
-      jsonEncode(data),
-    );
   }
 
   // ============================================================
@@ -3381,36 +2573,31 @@ class _MapPageState extends State<MapPage> {
       return coordinatesCache[normalized];
     }
 
+    final client = http.Client();
     try {
-      final uri = Uri.https(
-        'nominatim.openstreetmap.org',
-        '/search',
-        {
-          'q': location,
-          'format': 'jsonv2',
-          'limit': '1',
-        },
-      );
+      final uri = Uri.https('nominatim.openstreetmap.org', '/search', {
+        'q': location,
+        'format': 'jsonv2',
+        'limit': '1',
+      });
 
-      final response = await http.get(
-        uri,
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'Derevarium/1.0',
-        },
-      );
+      final response = await client
+          .get(
+            uri,
+            headers: {
+              'Accept': 'application/json',
+              'User-Agent': 'Derevarium/1.0',
+            },
+          )
+          .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body);
 
         if (data.isNotEmpty) {
-          final lat = double.tryParse(
-            data[0]['lat'].toString(),
-          );
+          final lat = double.tryParse(data[0]['lat'].toString());
 
-          final lon = double.tryParse(
-            data[0]['lon'].toString(),
-          );
+          final lon = double.tryParse(data[0]['lon'].toString());
 
           if (lat != null && lon != null) {
             final point = LatLng(lat, lon);
@@ -3421,7 +2608,11 @@ class _MapPageState extends State<MapPage> {
           }
         }
       }
-    } catch (_) {}
+    } catch (_) {
+      return null;
+    } finally {
+      client.close();
+    }
 
     return null;
   }
@@ -3431,12 +2622,10 @@ class _MapPageState extends State<MapPage> {
   // ============================================================
 
   Future<void> findMissingCoordinates() async {
-    final Set<String> locations = widget.trees
-        .map((tree) => tree.location.trim())
-        .where((location) => location.isNotEmpty)
-        .toSet();
+    final locations = currentLocations;
 
     for (final location in locations) {
+      if (!mounted) return;
       final normalized = normalizeLocation(location);
 
       // Відоме місто
@@ -3453,10 +2642,8 @@ class _MapPageState extends State<MapPage> {
       }
 
       // OpenStreetMap
-      await Future.delayed(
-        const Duration(milliseconds: 1100),
-      );
-
+      await Future.delayed(const Duration(milliseconds: 1100));
+      if (!mounted) return;
       await geocodeLocation(location);
     }
 
@@ -3479,10 +2666,7 @@ class _MapPageState extends State<MapPage> {
 
       final normalized = normalizeLocation(originalLocation);
 
-      result.putIfAbsent(
-        normalized,
-        () => [],
-      ).add(tree);
+      result.putIfAbsent(normalized, () => []).add(tree);
     }
 
     return result;
@@ -3513,9 +2697,7 @@ class _MapPageState extends State<MapPage> {
       appBar: AppBar(
         title: const Text(
           '🗺️ Карта відкриттів',
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-          ),
+          style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
 
@@ -3526,9 +2708,7 @@ class _MapPageState extends State<MapPage> {
                 children: [
                   CircularProgressIndicator(),
                   SizedBox(height: 15),
-                  Text(
-                    'Шукаємо локації на карті...',
-                  ),
+                  Text('Шукаємо локації на карті...'),
                 ],
               ),
             )
@@ -3540,10 +2720,7 @@ class _MapPageState extends State<MapPage> {
 
                 FlutterMap(
                   options: const MapOptions(
-                    initialCenter: LatLng(
-                      48.2915,
-                      25.9403,
-                    ),
+                    initialCenter: LatLng(48.2915, 25.9403),
                     initialZoom: 6,
                     minZoom: 3,
                     maxZoom: 18,
@@ -3553,188 +2730,144 @@ class _MapPageState extends State<MapPage> {
                     TileLayer(
                       urlTemplate:
                           'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                      userAgentPackageName:
-                          'com.example.derevarium',
+                      userAgentPackageName: 'com.example.derevarium',
                     ),
 
                     // ==================================================
                     // MARKERS
                     // ==================================================
-
                     MarkerLayer(
-                      markers: mappedGroups.map(
-                        (entry) {
-                          final location = entry.key;
+                      markers: mappedGroups.map((entry) {
+                        final location = entry.key;
 
-                          final treesAtLocation =
-                              entry.value;
+                        final treesAtLocation = entry.value;
 
-                          // ОТРИМУЄМО КООРДИНАТИ
-                          final coordinates =
-                              getCoordinates(location)!;
+                        // ОТРИМУЄМО КООРДИНАТИ
+                        final coordinates = getCoordinates(location)!;
 
-                          return Marker(
-                            point: coordinates,
-                            width: 110,
-                            height: 110,
+                        return Marker(
+                          point: coordinates,
+                          width: 110,
+                          height: 110,
 
-                            child: GestureDetector(
-                              onTap: () {
-                                showModalBottomSheet(
-                                  context: context,
-                                  builder: (context) {
-                                    return SafeArea(
-                                      child: Padding(
-                                        padding:
-                                            const EdgeInsets.all(
-                                          20,
-                                        ),
-                                        child: Column(
-                                          mainAxisSize:
-                                              MainAxisSize.min,
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              '📍 $location',
-                                              style:
-                                                  const TextStyle(
-                                                fontSize: 22,
-                                                fontWeight:
-                                                    FontWeight.bold,
+                          child: GestureDetector(
+                            onTap: () {
+                              showModalBottomSheet(
+                                context: context,
+                                builder: (context) {
+                                  return SafeArea(
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(20),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            '📍 $location',
+                                            style: const TextStyle(
+                                              fontSize: 22,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+
+                                          const SizedBox(height: 10),
+
+                                          Text(
+                                            'Знайдено дерев: ${treesAtLocation.length}',
+                                            style: const TextStyle(
+                                              fontSize: 16,
+                                            ),
+                                          ),
+
+                                          const SizedBox(height: 12),
+
+                                          ...treesAtLocation.map((tree) {
+                                            return Padding(
+                                              padding: const EdgeInsets.only(
+                                                bottom: 6,
                                               ),
-                                            ),
+                                              child: Row(
+                                                children: [
+                                                  const Icon(
+                                                    Icons.eco,
+                                                    size: 18,
+                                                    color: Colors.green,
+                                                  ),
 
-                                            const SizedBox(
-                                              height: 10,
-                                            ),
+                                                  const SizedBox(width: 8),
 
-                                            Text(
-                                              'Знайдено дерев: ${treesAtLocation.length}',
-                                              style:
-                                                  const TextStyle(
-                                                fontSize: 16,
+                                                  Expanded(
+                                                    child: Text(
+                                                      tree.type,
+                                                      style: const TextStyle(
+                                                        fontSize: 16,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
                                               ),
-                                            ),
-
-                                            const SizedBox(
-                                              height: 12,
-                                            ),
-
-                                            ...treesAtLocation.map(
-                                              (tree) {
-                                                return Padding(
-                                                  padding:
-                                                      const EdgeInsets.only(
-                                                    bottom: 6,
-                                                  ),
-                                                  child: Row(
-                                                    children: [
-                                                      const Icon(
-                                                        Icons.eco,
-                                                        size: 18,
-                                                        color:
-                                                            Colors.green,
-                                                      ),
-
-                                                      const SizedBox(
-                                                        width: 8,
-                                                      ),
-
-                                                      Expanded(
-                                                        child: Text(
-                                                          tree.type,
-                                                          style:
-                                                              const TextStyle(
-                                                            fontSize: 16,
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                );
-                                              },
-                                            ),
-                                          ],
-                                        ),
+                                            );
+                                          }),
+                                        ],
                                       ),
-                                    );
-                                  },
-                                );
-                              },
+                                    ),
+                                  );
+                                },
+                              );
+                            },
 
-                              child: Column(
-                                mainAxisSize:
-                                    MainAxisSize.min,
-                                children: [
-                                  Container(
-                                    width: 54,
-                                    height: 54,
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Container(
+                                  width: 54,
+                                  height: 54,
 
-                                    decoration:
-                                        BoxDecoration(
-                                      color: Colors.green,
-                                      shape:
-                                          BoxShape.circle,
+                                  decoration: BoxDecoration(
+                                    color: Colors.green,
+                                    shape: BoxShape.circle,
 
-                                      border:
-                                          Border.all(
-                                        color:
-                                            Colors.white,
-                                        width: 4,
-                                      ),
-
-                                      boxShadow:
-                                          const [
-                                        BoxShadow(
-                                          blurRadius: 8,
-                                          spreadRadius: 1,
-                                        ),
-                                      ],
+                                    border: Border.all(
+                                      color: Colors.white,
+                                      width: 4,
                                     ),
 
-                                    child: const Icon(
-                                      Icons.park,
-                                      color:
-                                          Colors.white,
-                                      size: 28,
-                                    ),
+                                    boxShadow: const [
+                                      BoxShadow(blurRadius: 8, spreadRadius: 1),
+                                    ],
                                   ),
 
-                                  Container(
-                                    padding:
-                                        const EdgeInsets
-                                            .symmetric(
-                                      horizontal: 7,
-                                      vertical: 3,
-                                    ),
+                                  child: const Icon(
+                                    Icons.park,
+                                    color: Colors.white,
+                                    size: 28,
+                                  ),
+                                ),
 
-                                    decoration:
-                                        BoxDecoration(
-                                      color:
-                                          Colors.white,
-                                      borderRadius:
-                                          BorderRadius
-                                              .circular(
-                                        10,
-                                      ),
-                                    ),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 3,
+                                  ),
 
-                                    child: Text(
-                                      '${treesAtLocation.length}',
-                                      style:
-                                          const TextStyle(
-                                        fontWeight:
-                                            FontWeight.bold,
-                                      ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white,
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+
+                                  child: Text(
+                                    '${treesAtLocation.length}',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
                                     ),
                                   ),
-                                ],
-                              ),
+                                ),
+                              ],
                             ),
-                          );
-                        },
-                      ).toList(),
+                          ),
+                        );
+                      }).toList(),
                     ),
                   ],
                 ),
@@ -3742,7 +2875,6 @@ class _MapPageState extends State<MapPage> {
                 // ==================================================
                 // ПОПЕРЕДЖЕННЯ
                 // ==================================================
-
                 if (mappedGroups.length < groups.length)
                   Positioned(
                     left: 16,
@@ -3751,13 +2883,11 @@ class _MapPageState extends State<MapPage> {
 
                     child: Card(
                       child: Padding(
-                        padding:
-                            const EdgeInsets.all(12),
+                        padding: const EdgeInsets.all(12),
 
                         child: Text(
                           '⚠️ Деякі локації ще не знайдені на карті.',
-                          textAlign:
-                              TextAlign.center,
+                          textAlign: TextAlign.center,
                         ),
                       ),
                     ),
@@ -3766,7 +2896,6 @@ class _MapPageState extends State<MapPage> {
                 // ==================================================
                 // ЛІЧИЛЬНИК
                 // ==================================================
-
                 Positioned(
                   left: 16,
                   right: 16,
@@ -3774,8 +2903,7 @@ class _MapPageState extends State<MapPage> {
 
                   child: Card(
                     child: Padding(
-                      padding:
-                          const EdgeInsets.all(14),
+                      padding: const EdgeInsets.all(14),
 
                       child: Row(
                         children: [
@@ -3784,17 +2912,13 @@ class _MapPageState extends State<MapPage> {
                             color: Colors.green,
                           ),
 
-                          const SizedBox(
-                            width: 10,
-                          ),
+                          const SizedBox(width: 10),
 
                           Expanded(
                             child: Text(
                               'Усього відкриттів: ${widget.trees.length}',
-                              style:
-                                  const TextStyle(
-                                fontWeight:
-                                    FontWeight.bold,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
                                 fontSize: 16,
                               ),
                             ),
@@ -3813,43 +2937,23 @@ class _MapPageState extends State<MapPage> {
 // STATS PAGE
 // ============================================================
 
-class StatsPage
-    extends StatelessWidget {
+class StatsPage extends StatelessWidget {
   final List<Tree> trees;
 
-  const StatsPage({
-    super.key,
-    required this.trees,
-  });
+  const StatsPage({super.key, required this.trees});
 
   int get uniqueTypes {
     return trees
-        .map(
-          (tree) =>
-              tree.type
-                  .trim()
-                  .toLowerCase(),
-        )
-        .where(
-          (type) =>
-              type.isNotEmpty,
-        )
+        .map((tree) => tree.type.trim().toLowerCase())
+        .where((type) => type.isNotEmpty)
         .toSet()
         .length;
   }
 
   int get uniqueLocations {
     return trees
-        .map(
-          (tree) =>
-              tree.location
-                  .trim()
-                  .toLowerCase(),
-        )
-        .where(
-          (location) =>
-              location.isNotEmpty,
-        )
+        .map((tree) => tree.location.trim().toLowerCase())
+        .where((location) => location.isNotEmpty)
         .toSet()
         .length;
   }
@@ -3859,32 +2963,26 @@ class StatsPage
       return '—';
     }
 
-    final counts =
-        <String, int>{};
+    final counts = <String, int>{};
 
     for (final tree in trees) {
-      final type =
-          tree.type.trim();
+      final type = tree.type.trim();
 
       if (type.isEmpty) {
         continue;
       }
 
-      counts[type] =
-          (counts[type] ?? 0) + 1;
+      counts[type] = (counts[type] ?? 0) + 1;
     }
 
     if (counts.isEmpty) {
       return '—';
     }
 
-    String result =
-        counts.keys.first;
+    String result = counts.keys.first;
 
-    for (final type
-        in counts.keys) {
-      if (counts[type]! >
-          counts[result]!) {
+    for (final type in counts.keys) {
+      if (counts[type]! > counts[result]!) {
         result = type;
       }
     }
@@ -3893,19 +2991,16 @@ class StatsPage
   }
 
   Map<String, int> get typeCounts {
-    final counts =
-        <String, int>{};
+    final counts = <String, int>{};
 
     for (final tree in trees) {
-      final type =
-          tree.type.trim();
+      final type = tree.type.trim();
 
       if (type.isEmpty) {
         continue;
       }
 
-      counts[type] =
-          (counts[type] ?? 0) + 1;
+      counts[type] = (counts[type] ?? 0) + 1;
     }
 
     return counts;
@@ -3915,287 +3010,142 @@ class StatsPage
   Widget build(BuildContext context) {
     const goal = 20;
 
-    final progress =
-        (uniqueTypes / goal)
-            .clamp(0.0, 1.0);
+    final progress = (uniqueTypes / goal).clamp(0.0, 1.0);
 
-    final sortedTypes =
-        typeCounts.entries.toList()
-          ..sort(
-            (a, b) =>
-                b.value.compareTo(
-              a.value,
-            ),
-          );
+    final sortedTypes = typeCounts.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
 
     return Scaffold(
-      appBar:
-          AppBar(
-        title:
-            const Text(
+      appBar: AppBar(
+        title: const Text(
           '📊 Статистика',
-          style:
-              TextStyle(
-            fontWeight:
-                FontWeight.bold,
-          ),
+          style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
-      body:
-          ListView(
-        padding:
-            const EdgeInsets.all(
-          16,
-        ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
         children: [
           Card(
-            child:
-                Padding(
-              padding:
-                  const EdgeInsets.all(
-                20,
-              ),
-              child:
-                  Column(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
                 children: [
                   const Icon(
-                    Icons
-                        .forest_rounded,
-                    size:
-                        55,
-                    color:
-                        Colors.green,
+                    Icons.forest_rounded,
+                    size: 55,
+                    color: Colors.green,
                   ),
-                  const SizedBox(
-                    height:
-                        10,
-                  ),
+                  const SizedBox(height: 10),
                   Text(
                     '${trees.length}',
-                    style:
-                        const TextStyle(
-                      fontSize:
-                          42,
-                      fontWeight:
-                          FontWeight.bold,
+                    style: const TextStyle(
+                      fontSize: 42,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
                   const Text(
                     'усього відкриттів',
-                    style:
-                        TextStyle(
-                      fontSize:
-                          17,
-                    ),
+                    style: TextStyle(fontSize: 17),
                   ),
                 ],
               ),
             ),
           ),
-          const SizedBox(
-            height:
-                14,
-          ),
+          const SizedBox(height: 14),
           Row(
             children: [
               Expanded(
-                child:
-                    _StatCard(
-                  icon:
-                      Icons.eco,
-                  value:
-                      '$uniqueTypes',
-                  label:
-                      'Різних видів',
+                child: _StatCard(
+                  icon: Icons.eco,
+                  value: '$uniqueTypes',
+                  label: 'Різних видів',
                 ),
               ),
-              const SizedBox(
-                width:
-                    10,
-              ),
+              const SizedBox(width: 10),
               Expanded(
-                child:
-                    _StatCard(
-                  icon:
-                      Icons.location_on,
-                  value:
-                      '$uniqueLocations',
-                  label:
-                      'Локацій',
+                child: _StatCard(
+                  icon: Icons.location_on,
+                  value: '$uniqueLocations',
+                  label: 'Локацій',
                 ),
               ),
             ],
           ),
-          const SizedBox(
-            height:
-                14,
-          ),
+          const SizedBox(height: 14),
           Card(
-            child:
-                Padding(
-              padding:
-                  const EdgeInsets.all(
-                20,
-              ),
-              child:
-                  Column(
-                crossAxisAlignment:
-                    CrossAxisAlignment
-                        .start,
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
                     '🌳 Прогрес колекції',
-                    style:
-                        TextStyle(
-                      fontSize:
-                          20,
-                      fontWeight:
-                          FontWeight.bold,
-                    ),
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),
-                  const SizedBox(
-                    height:
-                        8,
-                  ),
-                  Text(
-                    '$uniqueTypes із $goal різних видів',
-                  ),
-                  const SizedBox(
-                    height:
-                        12,
-                  ),
+                  const SizedBox(height: 8),
+                  Text('$uniqueTypes із $goal різних видів'),
+                  const SizedBox(height: 12),
                   ClipRRect(
-                    borderRadius:
-                        BorderRadius.circular(
-                      10,
-                    ),
-                    child:
-                        LinearProgressIndicator(
-                      value:
-                          progress.toDouble(),
-                      minHeight:
-                          14,
+                    borderRadius: BorderRadius.circular(10),
+                    child: LinearProgressIndicator(
+                      value: progress.toDouble(),
+                      minHeight: 14,
                     ),
                   ),
-                  const SizedBox(
-                    height:
-                        8,
-                  ),
+                  const SizedBox(height: 8),
                   Text(
                     '${(progress * 100).round()}%',
-                    style:
-                        const TextStyle(
-                      fontWeight:
-                          FontWeight.bold,
-                    ),
+                    style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                 ],
               ),
             ),
           ),
-          const SizedBox(
-            height:
-                14,
-          ),
+          const SizedBox(height: 14),
           Card(
-            child:
-                ListTile(
-              leading:
-                  const CircleAvatar(
-                child:
-                    Icon(
-                  Icons.eco,
-                ),
-              ),
-              title:
-                  const Text(
-                'Найчастіше знайдене дерево',
-              ),
-              subtitle:
-                  Text(
-                mostCommonTree,
-              ),
+            child: ListTile(
+              leading: const CircleAvatar(child: Icon(Icons.eco)),
+              title: const Text('Найчастіше знайдене дерево'),
+              subtitle: Text(mostCommonTree),
             ),
           ),
-          const SizedBox(
-            height:
-                14,
-          ),
+          const SizedBox(height: 14),
           Card(
-            child:
-                Padding(
-              padding:
-                  const EdgeInsets.all(
-                20,
-              ),
-              child:
-                  Column(
-                crossAxisAlignment:
-                    CrossAxisAlignment
-                        .start,
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
                     '🌱 Види у твоїй колекції',
-                    style:
-                        TextStyle(
-                      fontSize:
-                          20,
-                      fontWeight:
-                          FontWeight.bold,
-                    ),
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),
-                  const SizedBox(
-                    height:
-                        12,
-                  ),
+                  const SizedBox(height: 12),
                   if (sortedTypes.isEmpty)
-                    const Text(
-                      'Поки що немає відкриттів.',
-                    )
+                    const Text('Поки що немає відкриттів.')
                   else
-                    ...sortedTypes.map(
-                      (entry) {
-                        return Padding(
-                          padding:
-                              const EdgeInsets
-                                  .only(
-                            bottom:
-                                10,
-                          ),
-                          child:
-                              Row(
-                            children: [
-                              const Icon(
-                                Icons
-                                    .park_outlined,
-                                size:
-                                    20,
-                                color:
-                                    Colors.green,
+                    ...sortedTypes.map((entry) {
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              Icons.park_outlined,
+                              size: 20,
+                              color: Colors.green,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(child: Text(entry.key)),
+                            Text(
+                              '${entry.value}',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
                               ),
-                              const SizedBox(
-                                width:
-                                    8,
-                              ),
-                              Expanded(
-                                child:
-                                    Text(
-                                  entry.key,
-                                ),
-                              ),
-                              Text(
-                                '${entry.value}',
-                                style:
-                                    const TextStyle(
-                                  fontWeight:
-                                      FontWeight.bold,
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                    ),
+                            ),
+                          ],
+                        ),
+                      );
+                    }),
                 ],
               ),
             ),
@@ -4210,8 +3160,7 @@ class StatsPage
 // STAT CARD
 // ============================================================
 
-class _StatCard
-    extends StatelessWidget {
+class _StatCard extends StatelessWidget {
   final IconData icon;
   final String value;
   final String label;
@@ -4225,45 +3174,18 @@ class _StatCard
   @override
   Widget build(BuildContext context) {
     return Card(
-      child:
-          Padding(
-        padding:
-            const EdgeInsets.all(
-          18,
-        ),
-        child:
-            Column(
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
           children: [
-            Icon(
-              icon,
-              size:
-                  32,
-              color:
-                  Colors.green,
-            ),
-            const SizedBox(
-              height:
-                  8,
-            ),
+            Icon(icon, size: 32, color: Colors.green),
+            const SizedBox(height: 8),
             Text(
               value,
-              style:
-                  const TextStyle(
-                fontSize:
-                    28,
-                fontWeight:
-                    FontWeight.bold,
-              ),
+              style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
             ),
-            const SizedBox(
-              height:
-                  4,
-            ),
-            Text(
-              label,
-              textAlign:
-                  TextAlign.center,
-            ),
+            const SizedBox(height: 4),
+            Text(label, textAlign: TextAlign.center),
           ],
         ),
       ),
@@ -4297,112 +3219,63 @@ class Achievement {
 // ACHIEVEMENTS PAGE
 // ============================================================
 
-class AchievementsPage
-    extends StatelessWidget {
+class AchievementsPage extends StatelessWidget {
   final List<Tree> trees;
 
-  const AchievementsPage({
-    super.key,
-    required this.trees,
-  });
+  const AchievementsPage({super.key, required this.trees});
 
   int get uniqueTypes {
     return trees
-        .map(
-          (tree) =>
-              tree.type
-                  .trim()
-                  .toLowerCase(),
-        )
-        .where(
-          (type) =>
-              type.isNotEmpty,
-        )
+        .map((tree) => tree.type.trim().toLowerCase())
+        .where((type) => type.isNotEmpty)
         .toSet()
         .length;
   }
 
   int get uniqueLocations {
     return trees
-        .map(
-          (tree) =>
-              tree.location
-                  .trim()
-                  .toLowerCase(),
-        )
-        .where(
-          (location) =>
-              location.isNotEmpty,
-        )
+        .map((tree) => tree.location.trim().toLowerCase())
+        .where((location) => location.isNotEmpty)
         .toSet()
         .length;
   }
 
   int get parkTrees {
-    return trees
-        .where(
-          (tree) =>
-              tree.locationType ==
-              'Парк',
-        )
-        .length;
+    return trees.where((tree) => tree.locationType == 'Парк').length;
   }
 
   int get outsideCityTrees {
     return trees
         .where(
           (tree) =>
-              tree.locationType ==
-                  'За містом' ||
-              tree.locationType ==
-                  'Село' ||
-              tree.locationType ==
-                  'Ліс',
+              tree.locationType == 'За містом' ||
+              tree.locationType == 'Село' ||
+              tree.locationType == 'Ліс',
         )
         .length;
   }
 
   int get treesWithFacts {
-    return trees
-        .where(
-          (tree) =>
-              tree.facts
-                  .trim()
-                  .isNotEmpty,
-        )
-        .length;
+    return trees.where((tree) => tree.facts.trim().isNotEmpty).length;
   }
 
   int get autumnTrees {
     return trees
         .where(
           (tree) =>
-              tree.dateFound.month ==
-                  9 ||
-              tree.dateFound.month ==
-                  10 ||
-              tree.dateFound.month ==
-                  11,
+              tree.dateFound.month == 9 ||
+              tree.dateFound.month == 10 ||
+              tree.dateFound.month == 11,
         )
         .length;
   }
 
   int get togetherTrees {
-    return trees
-        .where(
-          (tree) =>
-              tree.foundTogether,
-        )
-        .length;
+    return trees.where((tree) => tree.foundTogether).length;
   }
 
   int get rareTrees {
-    return trees
-        .where(
-          (tree) =>
-              tree.isRare,
-        )
-        .length;
+    return trees.where((tree) => tree.isRare).length;
   }
 
   int get maxStreak {
@@ -4410,18 +3283,16 @@ class AchievementsPage
       return 0;
     }
 
-    final dates =
-        trees
-            .map(
-              (tree) =>
-                  DateTime(
-                tree.dateFound.year,
-                tree.dateFound.month,
-                tree.dateFound.day,
-              ),
-            )
-            .toSet()
-            .toList();
+    final dates = trees
+        .map(
+          (tree) => DateTime(
+            tree.dateFound.year,
+            tree.dateFound.month,
+            tree.dateFound.day,
+          ),
+        )
+        .toSet()
+        .toList();
 
     dates.sort();
 
@@ -4432,15 +3303,8 @@ class AchievementsPage
     int longest = 1;
     int current = 1;
 
-    for (int i = 1;
-        i < dates.length;
-        i++) {
-      final difference =
-          dates[i]
-              .difference(
-                dates[i - 1],
-              )
-              .inDays;
+    for (int i = 1; i < dates.length; i++) {
+      final difference = dates[i].difference(dates[i - 1]).inDays;
 
       if (difference == 1) {
         current++;
@@ -4459,345 +3323,171 @@ class AchievementsPage
   List<Achievement> get achievements {
     return [
       Achievement(
-        title:
-            'Перший листок',
-        description:
-            'Додай своє перше дерево в колекцію.',
-        icon:
-            Icons.eco,
-        progress:
-            trees.isEmpty ? 0 : 1,
-        goal:
-            1,
-        unlocked:
-            trees.isNotEmpty,
+        title: 'Перший листок',
+        description: 'Додай своє перше дерево в колекцію.',
+        icon: Icons.eco,
+        progress: trees.isEmpty ? 0 : 1,
+        goal: 1,
+        unlocked: trees.isNotEmpty,
       ),
       Achievement(
-        title:
-            'Разом веселіше',
-        description:
-            'Додай дерево, яке сфотографували разом.',
-        icon:
-            Icons.favorite,
-        progress:
-            togetherTrees > 0
-                ? 1
-                : 0,
-        goal:
-            1,
-        unlocked:
-            togetherTrees > 0,
+        title: 'Разом веселіше',
+        description: 'Додай дерево, яке сфотографували разом.',
+        icon: Icons.favorite,
+        progress: togetherTrees > 0 ? 1 : 0,
+        goal: 1,
+        unlocked: togetherTrees > 0,
       ),
       Achievement(
-        title:
-            'Трилогія',
-        description:
-            'Збери 3 різні види дерев.',
-        icon:
-            Icons.filter_3,
-        progress:
-            uniqueTypes.clamp(
-          0,
-          3,
-        ),
-        goal:
-            3,
-        unlocked:
-            uniqueTypes >= 3,
+        title: 'Трилогія',
+        description: 'Збери 3 різні види дерев.',
+        icon: Icons.filter_3,
+        progress: uniqueTypes.clamp(0, 3),
+        goal: 3,
+        unlocked: uniqueTypes >= 3,
       ),
       Achievement(
-        title:
-            'Ботанік-початківець',
-        description:
-            'Збери 10 різних видів дерев.',
-        icon:
-            Icons.local_florist,
-        progress:
-            uniqueTypes.clamp(
-          0,
-          10,
-        ),
-        goal:
-            10,
-        unlocked:
-            uniqueTypes >= 10,
+        title: 'Ботанік-початківець',
+        description: 'Збери 10 різних видів дерев.',
+        icon: Icons.local_florist,
+        progress: uniqueTypes.clamp(0, 10),
+        goal: 10,
+        unlocked: uniqueTypes >= 10,
       ),
       Achievement(
-        title:
-            'Дендролог',
-        description:
-            'Збери 25 різних видів дерев.',
-        icon:
-            Icons.forest,
-        progress:
-            uniqueTypes.clamp(
-          0,
-          25,
-        ),
-        goal:
-            25,
-        unlocked:
-            uniqueTypes >= 25,
+        title: 'Дендролог',
+        description: 'Збери 25 різних видів дерев.',
+        icon: Icons.forest,
+        progress: uniqueTypes.clamp(0, 25),
+        goal: 25,
+        unlocked: uniqueTypes >= 25,
       ),
       Achievement(
-        title:
-            'Лісовий магістр',
-        description:
-            'Збери 50 різних видів дерев.',
-        icon:
-            Icons.workspace_premium,
-        progress:
-            uniqueTypes.clamp(
-          0,
-          50,
-        ),
-        goal:
-            50,
-        unlocked:
-            uniqueTypes >= 50,
+        title: 'Лісовий магістр',
+        description: 'Збери 50 різних видів дерев.',
+        icon: Icons.workspace_premium,
+        progress: uniqueTypes.clamp(0, 50),
+        goal: 50,
+        unlocked: uniqueTypes >= 50,
       ),
       Achievement(
-        title:
-            'Рідкісний екземпляр',
-        description:
-            'Знайди вид, який позначений як рідкісний.',
-        icon:
-            Icons.star,
-        progress:
-            rareTrees > 0
-                ? 1
-                : 0,
-        goal:
-            1,
-        unlocked:
-            rareTrees > 0,
+        title: 'Рідкісний екземпляр',
+        description: 'Знайди вид, який позначений як рідкісний.',
+        icon: Icons.star,
+        progress: rareTrees > 0 ? 1 : 0,
+        goal: 1,
+        unlocked: rareTrees > 0,
       ),
       Achievement(
-        title:
-            'Перша мандрівка',
-        description:
-            'Відкрий першу нову локацію.',
-        icon:
-            Icons.place,
-        progress:
-            uniqueLocations >= 1
-                ? 1
-                : 0,
-        goal:
-            1,
-        unlocked:
-            uniqueLocations >= 1,
+        title: 'Перша мандрівка',
+        description: 'Відкрий першу нову локацію.',
+        icon: Icons.place,
+        progress: uniqueLocations >= 1 ? 1 : 0,
+        goal: 1,
+        unlocked: uniqueLocations >= 1,
       ),
       Achievement(
-        title:
-            'Мандрівники',
-        description:
-            'Додай дерева з 5 різних локацій.',
-        icon:
-            Icons.map,
-        progress:
-            uniqueLocations.clamp(
-          0,
-          5,
-        ),
-        goal:
-            5,
-        unlocked:
-            uniqueLocations >= 5,
+        title: 'Мандрівники',
+        description: 'Додай дерева з 5 різних локацій.',
+        icon: Icons.map,
+        progress: uniqueLocations.clamp(0, 5),
+        goal: 5,
+        unlocked: uniqueLocations >= 5,
       ),
       Achievement(
-        title:
-            'Парковий детектив',
-        description:
-            'Знайди 10 дерев у парках.',
-        icon:
-            Icons.park,
-        progress:
-            parkTrees.clamp(
-          0,
-          10,
-        ),
-        goal:
-            10,
-        unlocked:
-            parkTrees >= 10,
+        title: 'Парковий детектив',
+        description: 'Знайди 10 дерев у парках.',
+        icon: Icons.park,
+        progress: parkTrees.clamp(0, 10),
+        goal: 10,
+        unlocked: parkTrees >= 10,
       ),
       Achievement(
-        title:
-            'За межами міста',
-        description:
-            'Додай дерево за межами міста.',
-        icon:
-            Icons.nature_people,
-        progress:
-            outsideCityTrees > 0
-                ? 1
-                : 0,
-        goal:
-            1,
-        unlocked:
-            outsideCityTrees > 0,
+        title: 'За межами міста',
+        description: 'Додай дерево за межами міста.',
+        icon: Icons.nature_people,
+        progress: outsideCityTrees > 0 ? 1 : 0,
+        goal: 1,
+        unlocked: outsideCityTrees > 0,
       ),
       Achievement(
-        title:
-            'Цікавий факт',
-        description:
-            'Додай перший факт про дерево.',
-        icon:
-            Icons.menu_book,
-        progress:
-            treesWithFacts > 0
-                ? 1
-                : 0,
-        goal:
-            1,
-        unlocked:
-            treesWithFacts > 0,
+        title: 'Цікавий факт',
+        description: 'Додай перший факт про дерево.',
+        icon: Icons.menu_book,
+        progress: treesWithFacts > 0 ? 1 : 0,
+        goal: 1,
+        unlocked: treesWithFacts > 0,
       ),
       Achievement(
-        title:
-            'Енциклопедія',
-        description:
-            'Додай факти до 10 різних дерев.',
-        icon:
-            Icons.auto_stories,
-        progress:
-            treesWithFacts.clamp(
-          0,
-          10,
-        ),
-        goal:
-            10,
-        unlocked:
-            treesWithFacts >= 10,
+        title: 'Енциклопедія',
+        description: 'Додай факти до 10 різних дерев.',
+        icon: Icons.auto_stories,
+        progress: treesWithFacts.clamp(0, 10),
+        goal: 10,
+        unlocked: treesWithFacts >= 10,
       ),
       Achievement(
-        title:
-            'Тижневий похід',
-        description:
-            'Додавай хоча б одне дерево 7 днів підряд.',
-        icon:
-            Icons.local_fire_department,
-        progress:
-            maxStreak.clamp(
-          0,
-          7,
-        ),
-        goal:
-            7,
-        unlocked:
-            maxStreak >= 7,
+        title: 'Тижневий похід',
+        description: 'Додавай хоча б одне дерево 7 днів підряд.',
+        icon: Icons.local_fire_department,
+        progress: maxStreak.clamp(0, 7),
+        goal: 7,
+        unlocked: maxStreak >= 7,
       ),
       Achievement(
-        title:
-            'Осінній сезон',
-        description:
-            'Додай 5 дерев восени.',
-        icon:
-            Icons.park_outlined,
-        progress:
-            autumnTrees.clamp(
-          0,
-          5,
-        ),
-        goal:
-            5,
-        unlocked:
-            autumnTrees >= 5,
+        title: 'Осінній сезон',
+        description: 'Додай 5 дерев восени.',
+        icon: Icons.park_outlined,
+        progress: autumnTrees.clamp(0, 5),
+        goal: 5,
+        unlocked: autumnTrees >= 5,
       ),
     ];
   }
 
   @override
   Widget build(BuildContext context) {
-    final all =
-        achievements;
+    final all = achievements;
 
-    final unlocked =
-        all.where(
-      (a) => a.unlocked,
-    ).length;
+    final unlocked = all.where((a) => a.unlocked).length;
 
     return Scaffold(
-      appBar:
-          AppBar(
-        title:
-            const Text(
+      appBar: AppBar(
+        title: const Text(
           '🏆 Досягнення',
-          style:
-              TextStyle(
-            fontWeight:
-                FontWeight.bold,
-          ),
+          style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
-      body:
-          ListView(
-        padding:
-            const EdgeInsets.all(
-          16,
-        ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
         children: [
           Card(
-            child:
-                Padding(
-              padding:
-                  const EdgeInsets.all(
-                20,
-              ),
-              child:
-                  Column(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
                 children: [
-                  const Icon(
-                    Icons
-                        .emoji_events,
-                    size:
-                        58,
-                    color:
-                        Colors.amber,
-                  ),
-                  const SizedBox(
-                    height:
-                        10,
-                  ),
+                  const Icon(Icons.emoji_events, size: 58, color: Colors.amber),
+                  const SizedBox(height: 10),
                   Text(
                     '$unlocked / ${all.length}',
-                    style:
-                        const TextStyle(
-                      fontSize:
-                          32,
-                      fontWeight:
-                          FontWeight.bold,
+                    style: const TextStyle(
+                      fontSize: 32,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
                   const Text(
                     'досягнень відкрито',
-                    style:
-                        TextStyle(
-                      fontSize:
-                          16,
-                    ),
+                    style: TextStyle(fontSize: 16),
                   ),
                 ],
               ),
             ),
           ),
-          const SizedBox(
-            height:
-                16,
-          ),
-          ...all.map(
-            (achievement) {
-              return _AchievementCard(
-                achievement:
-                    achievement,
-              );
-            },
-          ),
-          const SizedBox(
-            height:
-                20,
-          ),
+          const SizedBox(height: 16),
+          ...all.map((achievement) {
+            return _AchievementCard(achievement: achievement);
+          }),
+          const SizedBox(height: 20),
         ],
       ),
     );
@@ -4808,170 +3498,82 @@ class AchievementsPage
 // ACHIEVEMENT CARD
 // ============================================================
 
-class _AchievementCard
-    extends StatelessWidget {
+class _AchievementCard extends StatelessWidget {
   final Achievement achievement;
 
-  const _AchievementCard({
-    required this.achievement,
-  });
+  const _AchievementCard({required this.achievement});
 
   @override
   Widget build(BuildContext context) {
-    final progress =
-        (achievement.progress /
-                achievement.goal)
-            .clamp(
-      0.0,
-      1.0,
-    );
+    final progress = (achievement.progress / achievement.goal).clamp(0.0, 1.0);
 
     return Card(
-      margin:
-          const EdgeInsets.only(
-        bottom:
-            12,
-      ),
-      child:
-          Padding(
-        padding:
-            const EdgeInsets.all(
-          16,
-        ),
-        child:
-            Row(
-          crossAxisAlignment:
-              CrossAxisAlignment
-                  .start,
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Container(
-              width:
-                  58,
-              height:
-                  58,
-              decoration:
-                  BoxDecoration(
-                shape:
-                    BoxShape.circle,
-                color:
-                    achievement
-                            .unlocked
-                        ? Colors
-                            .amber
-                            .withValues(
-                            alpha:
-                                0.18,
-                          )
-                        : Colors
-                            .grey
-                            .withValues(
-                            alpha:
-                                0.15,
-                          ),
+              width: 58,
+              height: 58,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: achievement.unlocked
+                    ? Colors.amber.withValues(alpha: 0.18)
+                    : Colors.grey.withValues(alpha: 0.15),
               ),
-              child:
-                  Icon(
-                achievement
-                    .icon,
-                size:
-                    30,
-                color:
-                    achievement
-                            .unlocked
-                        ? Colors
-                            .amber
-                        : Colors
-                            .grey,
+              child: Icon(
+                achievement.icon,
+                size: 30,
+                color: achievement.unlocked ? Colors.amber : Colors.grey,
               ),
             ),
-            const SizedBox(
-              width:
-                  14,
-            ),
+            const SizedBox(width: 14),
             Expanded(
-              child:
-                  Column(
-                crossAxisAlignment:
-                    CrossAxisAlignment
-                        .start,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Row(
                     children: [
                       Expanded(
-                        child:
-                            Text(
-                          achievement
-                              .title,
-                          style:
-                              const TextStyle(
-                            fontSize:
-                                18,
-                            fontWeight:
-                                FontWeight.bold,
+                        child: Text(
+                          achievement.title,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
                       ),
                       Icon(
-                        achievement
-                                .unlocked
-                            ? Icons
-                                .check_circle
-                            : Icons
-                                .lock_outline,
-                        size:
-                            20,
-                        color:
-                            achievement
-                                    .unlocked
-                                ? Colors
-                                    .green
-                                : Colors
-                                    .grey,
+                        achievement.unlocked
+                            ? Icons.check_circle
+                            : Icons.lock_outline,
+                        size: 20,
+                        color: achievement.unlocked
+                            ? Colors.green
+                            : Colors.grey,
                       ),
                     ],
                   ),
-                  const SizedBox(
-                    height:
-                        5,
-                  ),
-                  Text(
-                    achievement
-                        .description,
-                  ),
-                  const SizedBox(
-                    height:
-                        10,
-                  ),
+                  const SizedBox(height: 5),
+                  Text(achievement.description),
+                  const SizedBox(height: 10),
                   Row(
                     children: [
                       Expanded(
-                        child:
-                            ClipRRect(
-                          borderRadius:
-                              BorderRadius
-                                  .circular(
-                            10,
-                          ),
-                          child:
-                              LinearProgressIndicator(
-                            value:
-                                progress.toDouble(),
-                            minHeight:
-                                8,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(10),
+                          child: LinearProgressIndicator(
+                            value: progress.toDouble(),
+                            minHeight: 8,
                           ),
                         ),
                       ),
-                      const SizedBox(
-                        width:
-                            10,
-                      ),
+                      const SizedBox(width: 10),
                       Text(
                         '${achievement.progress}/${achievement.goal}',
-                        style:
-                            const TextStyle(
-                          fontWeight:
-                              FontWeight.bold,
-                        ),
+                        style: const TextStyle(fontWeight: FontWeight.bold),
                       ),
                     ],
                   ),

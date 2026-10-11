@@ -729,7 +729,7 @@ class _AddTreePageState
 
             DropdownButtonFormField<
                 String>(
-              value:
+              initialValue:
                   selectedTreeType,
 
               decoration:
@@ -783,7 +783,7 @@ class _AddTreePageState
 
             DropdownButtonFormField<
                 String>(
-              value:
+              initialValue:
                   selectedLocation,
 
               decoration:

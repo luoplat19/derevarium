@@ -6,41 +6,48 @@ class TreeFactsResult {
   final String facts;
   final String sourceUrl;
 
-  TreeFactsResult({
-    required this.facts,
-    required this.sourceUrl,
-  });
+  TreeFactsResult({required this.facts, required this.sourceUrl});
 }
 
 class TreeFactsApi {
-  static const String _baseUrl =
-      'https://uk.wikipedia.org/api/rest_v1';
+  static const String _baseUrl = 'https://uk.wikipedia.org/api/rest_v1';
 
   static Future<TreeFactsResult?> getFacts({
     required String commonName,
     required String scientificName,
   }) async {
+    final client = http.Client();
+    try {
+      return await _findFacts(
+        commonName,
+        scientificName,
+        client,
+      ).timeout(const Duration(seconds: 20), onTimeout: () => null);
+    } finally {
+      client.close();
+    }
+  }
+
+  static Future<TreeFactsResult?> _findFacts(
+    String commonName,
+    String scientificName,
+    http.Client client,
+  ) async {
     // Спочатку пробуємо звичайну назву.
-    TreeFactsResult? result =
-        await _getSummary(commonName);
+    TreeFactsResult? result = await _getSummary(commonName, client);
 
     // Якщо сторінки за звичайною назвою немає —
     // пробуємо наукову.
-    if (result == null &&
-        scientificName.trim().isNotEmpty) {
-      result = await _getSummary(scientificName);
+    if (result == null && scientificName.trim().isNotEmpty) {
+      result = await _getSummary(scientificName, client);
     }
 
     // Якщо все одно нічого не знайшли —
     // пробуємо пошук Wikipedia.
-    if (result == null) {
-      result = await _searchAndGetSummary(commonName);
-    }
+    result ??= await _searchAndGetSummary(commonName, client);
 
-    if (result == null &&
-        scientificName.trim().isNotEmpty) {
-      result =
-          await _searchAndGetSummary(scientificName);
+    if (result == null && scientificName.trim().isNotEmpty) {
+      result = await _searchAndGetSummary(scientificName, client);
     }
 
     return result;
@@ -48,6 +55,7 @@ class TreeFactsApi {
 
   static Future<TreeFactsResult?> _getSummary(
     String title,
+    http.Client client,
   ) async {
     final cleanTitle = title.trim();
 
@@ -56,29 +64,24 @@ class TreeFactsApi {
     }
 
     try {
-      final encodedTitle =
-          Uri.encodeComponent(cleanTitle);
+      final encodedTitle = Uri.encodeComponent(cleanTitle);
 
-      final uri = Uri.parse(
-        '$_baseUrl/page/summary/$encodedTitle',
-      );
+      final uri = Uri.parse('$_baseUrl/page/summary/$encodedTitle');
 
-      final response = await http.get(uri);
+      final response = await client
+          .get(uri)
+          .timeout(const Duration(seconds: 8));
 
       if (response.statusCode != 200) {
         return null;
       }
 
-      final Map<String, dynamic> data =
-          jsonDecode(response.body);
+      final Map<String, dynamic> data = jsonDecode(response.body);
 
-      final extract =
-          data['extract']?.toString().trim() ?? '';
+      final extract = data['extract']?.toString().trim() ?? '';
 
       final pageUrl =
-          data['content_urls']?['desktop']?['page']
-                  ?.toString() ??
-              '';
+          data['content_urls']?['desktop']?['page']?.toString() ?? '';
 
       if (extract.isEmpty) {
         return null;
@@ -90,18 +93,15 @@ class TreeFactsApi {
         return null;
       }
 
-      return TreeFactsResult(
-        facts: facts,
-        sourceUrl: pageUrl,
-      );
+      return TreeFactsResult(facts: facts, sourceUrl: pageUrl);
     } catch (_) {
       return null;
     }
   }
 
-  static Future<TreeFactsResult?>
-      _searchAndGetSummary(
+  static Future<TreeFactsResult?> _searchAndGetSummary(
     String query,
+    http.Client client,
   ) async {
     final cleanQuery = query.trim();
 
@@ -116,14 +116,15 @@ class TreeFactsApi {
         '&limit=3',
       );
 
-      final response = await http.get(uri);
+      final response = await client
+          .get(uri)
+          .timeout(const Duration(seconds: 8));
 
       if (response.statusCode != 200) {
         return null;
       }
 
-      final Map<String, dynamic> data =
-          jsonDecode(response.body);
+      final Map<String, dynamic> data = jsonDecode(response.body);
 
       final pages = data['pages'];
 
@@ -136,15 +137,13 @@ class TreeFactsApi {
           continue;
         }
 
-        final title =
-            page['title']?.toString().trim() ?? '';
+        final title = page['title']?.toString().trim() ?? '';
 
         if (title.isEmpty) {
           continue;
         }
 
-        final result =
-            await _getSummary(title);
+        final result = await _getSummary(title, client);
 
         if (result != null) {
           return result;
@@ -182,8 +181,6 @@ class TreeFactsApi {
     // Беремо максимум 4 речення.
     final selected = sentences.take(4).toList();
 
-    return selected
-        .map((sentence) => '🌿 $sentence')
-        .join('\n\n');
+    return selected.map((sentence) => '🌿 $sentence').join('\n\n');
   }
 }
