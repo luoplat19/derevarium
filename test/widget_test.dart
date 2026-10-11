@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:derevarium/main.dart';
+import 'package:derevarium/storage_backend_factory.dart';
 import 'package:derevarium/plantnet_api.dart';
 import 'package:derevarium/tree_facts_api.dart';
 import 'package:flutter/material.dart';
@@ -49,6 +50,15 @@ Future<void> mountHome(WidgetTester tester) async {
   await tester.pumpAndSettle();
 }
 
+Future<List<String>> storedRows() async {
+  final backend = createCollectionBackend();
+  try {
+    return (await backend.read())!.records.values.toList();
+  } finally {
+    backend.close();
+  }
+}
+
 Future<void> openBestiaryEditor(WidgetTester tester) async {
   await tester.tap(find.text('Бестіарій'));
   await tester.pumpAndSettle();
@@ -80,6 +90,58 @@ class StalledBodyClient extends http.BaseClient {
 
 void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
+  testWidgets(
+    'Mobile navigation and tree editing fit a narrow screen with enlarged text',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({
+        'trees': [
+          jsonEncode(sampleTree(notes: 'Спогад про нашу прогулянку').toJson()),
+        ],
+      });
+      await mountHome(tester);
+      tester.view.physicalSize = const Size(320, 568);
+      tester.platformDispatcher.textScaleFactorTestValue = 1.3;
+      addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      final camera = find.byIcon(Icons.photo_camera_outlined);
+      await tester.ensureVisible(camera);
+      await tester.tap(camera);
+      await tester.pumpAndSettle();
+      expect(find.text('Нове дерево'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pageBack();
+      await tester.pumpAndSettle();
+      await openBestiaryEditor(tester);
+      expect(tester.takeException(), isNull);
+      final history = find.widgetWithText(TextField, 'Наша історія');
+      await tester.ensureVisible(history);
+      expect(tester.takeException(), isNull);
+      await tester.enterText(history, 'Оновлений спогад');
+      await saveEditor(tester);
+      expect(
+        jsonDecode((await storedRows()).single)['notes'],
+        'Оновлений спогад',
+      );
+      expect(tester.takeException(), isNull);
+      final navigation = find.byType(NavigationBar);
+      await tester.tap(
+        find.descendant(of: navigation, matching: find.text('Досягнення')),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      await tester.tap(
+        find.descendant(of: navigation, matching: find.text('Головна')),
+      );
+      await tester.pumpAndSettle();
+      final counts = find.text('знахідок');
+      await tester.ensureVisible(counts);
+      await tester.tap(counts);
+      await tester.pumpAndSettle();
+      expect(find.text('Статистика'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
   testWidgets('Loads valid trees and preserves unreadable records on save', (
     tester,
   ) async {
@@ -104,13 +166,21 @@ void main() {
       ),
       isTrue,
     );
-    final persisted = (await store.getAll())['flutter.trees'] as List<String>;
+    final persisted = await storedRows();
     expect(persisted, hasLength(4));
     expect(persisted, containsAll(['{broken', invalidType]));
+    expect((await store.getAll())['flutter.trees'], [
+      original,
+      '{broken',
+      invalidType,
+    ]);
+    expect(await home.applyTreeAction(TreeAction(tree: sampleTree())), isTrue);
+    expect(await storedRows(), hasLength(5));
+    expect(await storedRows(), containsAll(['{broken', invalidType]));
     await tester.pumpWidget(const SizedBox());
     await mountHome(tester);
     final dynamic reloaded = tester.state(find.byType(HomePage));
-    expect(reloaded.trees, hasLength(2));
+    expect(reloaded.trees, hasLength(3));
   });
   testWidgets('Edits from the bestiary persist and survive reopening', (
     tester,
@@ -120,15 +190,13 @@ void main() {
     });
     await mountHome(tester);
     await openBestiaryEditor(tester);
-    final notes = find.widgetWithText(TextField, '❤️ Наша історія');
+    final notes = find.widgetWithText(TextField, 'Наша історія');
     await tester.ensureVisible(notes);
     await tester.enterText(notes, 'Знайшли разом біля парку');
     await saveEditor(tester);
     expect(find.byType(AddTreePage), findsNothing);
     expect(
-      jsonDecode(
-        (await SharedPreferences.getInstance()).getStringList('trees')!.single,
-      )['notes'],
+      jsonDecode((await storedRows()).single)['notes'],
       'Знайшли разом біля парку',
     );
     await tester.pumpWidget(const SizedBox());
@@ -151,10 +219,7 @@ void main() {
     await tester.pumpAndSettle();
     final dynamic home = tester.state(find.byType(HomePage));
     expect(home.trees, isEmpty);
-    expect(
-      (await SharedPreferences.getInstance()).getStringList('trees'),
-      isEmpty,
-    );
+    expect(await storedRows(), isEmpty);
     expect(find.byType(AddTreePage), findsNothing);
   });
   for (final throwsError in [false, true]) {
@@ -168,7 +233,7 @@ void main() {
         SharedPreferencesStorePlatform.instance = store;
         await mountHome(tester);
         await openBestiaryEditor(tester);
-        final notes = find.widgetWithText(TextField, '❤️ Наша історія');
+        final notes = find.widgetWithText(TextField, 'Наша історія');
         await tester.ensureVisible(notes);
         await tester.enterText(notes, 'Зміна');
         store.rejectWrites = !throwsError;
@@ -193,12 +258,7 @@ void main() {
         await tester.pumpAndSettle();
         await saveEditor(tester);
         expect(find.byType(AddTreePage), findsNothing);
-        expect(
-          jsonDecode(
-            ((await store.getAll())['flutter.trees'] as List<String>).single,
-          )['notes'],
-          'Зміна',
-        );
+        expect(jsonDecode((await storedRows()).single)['notes'], 'Зміна');
       },
     );
   }

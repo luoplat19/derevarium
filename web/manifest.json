@@ -1,11 +1,11 @@
 {
-    "name": "derevarium",
-    "short_name": "derevarium",
+    "name": "Derevarium",
+    "short_name": "Derevarium",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#051F20",
+    "theme_color": "#051F20",
+    "description": "Наша колекція дерев і спогадів про прогулянки.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

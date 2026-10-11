@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -7,10 +8,17 @@ import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:image/image.dart' as img;
 
 import 'plantnet_api.dart';
 import 'tree_facts_api.dart';
+import 'tree.dart';
+import 'tree_repository.dart';
+import 'storage_backend.dart';
+import 'storage_settings.dart';
+import 'photo.dart';
+import 'app_theme.dart';
+import 'home_content.dart';
+export 'tree.dart';
 
 void main() {
   runApp(const TreeApp());
@@ -21,96 +29,16 @@ void main() {
 // ============================================================
 
 class TreeApp extends StatelessWidget {
-  const TreeApp({super.key});
+  final TreeRepository? repository;
+  const TreeApp({super.key, this.repository});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Derevarium',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
-        useMaterial3: true,
-      ),
-      home: const HomePage(),
-    );
-  }
-}
-
-// ============================================================
-// TREE MODEL
-// ============================================================
-
-class Tree {
-  String type;
-  String location;
-  String locationType;
-  String facts;
-  String notes;
-  String? imageBase64;
-  DateTime dateFound;
-  bool foundTogether;
-  bool isRare;
-
-  Tree({
-    required this.type,
-    required this.location,
-    required this.locationType,
-    required this.facts,
-    this.notes = '',
-    required this.dateFound,
-    this.imageBase64,
-    this.foundTogether = false,
-    this.isRare = false,
-  });
-
-  Map<String, dynamic> toJson() {
-    return {
-      'type': type,
-      'location': location,
-      'locationType': locationType,
-      'facts': facts,
-      'notes': notes,
-      'imageBase64': imageBase64,
-      'dateFound': dateFound.toIso8601String(),
-      'foundTogether': foundTogether,
-      'isRare': isRare,
-    };
-  }
-
-  factory Tree.fromJson(Map<String, dynamic> json) {
-    for (final field in [
-      'type',
-      'name',
-      'location',
-      'locationType',
-      'facts',
-      'notes',
-      'imageBase64',
-      'dateFound',
-    ]) {
-      if (json[field] != null && json[field] is! String) {
-        throw FormatException('Некоректне поле $field');
-      }
-    }
-    for (final field in ['foundTogether', 'isRare']) {
-      if (json[field] != null && json[field] is! bool) {
-        throw FormatException('Некоректне поле $field');
-      }
-    }
-    if (json['imageBase64'] != null) {
-      base64Decode(json['imageBase64'] as String);
-    }
-    return Tree(
-      type: json['type'] ?? json['name'] ?? '',
-      location: json['location'] ?? '',
-      locationType: json['locationType'] ?? 'Місто',
-      facts: json['facts'] ?? '',
-      notes: json['notes'] ?? '',
-      imageBase64: json['imageBase64'],
-      dateFound: DateTime.tryParse(json['dateFound'] ?? '') ?? DateTime.now(),
-      foundTogether: json['foundTogether'] ?? false,
-      isRare: json['isRare'] ?? false,
+      theme: derevariumTheme(),
+      home: HomePage(repository: repository),
     );
   }
 }
@@ -143,7 +71,8 @@ const String allFilter = '__ALL__';
 // ============================================================
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  final TreeRepository? repository;
+  const HomePage({super.key, this.repository});
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -151,7 +80,8 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   List<Tree> trees = [];
-  final List<String> unreadableTrees = [];
+  final Map<String, String> unreadableTrees = {};
+  late final TreeRepository repository;
   bool treesLoaded = false;
   bool savingTrees = false;
 
@@ -168,7 +98,14 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    repository = widget.repository ?? TreeRepository();
     loadTrees();
+  }
+
+  @override
+  void dispose() {
+    if (widget.repository == null) repository.close();
+    super.dispose();
   }
 
   // ============================================================
@@ -177,32 +114,24 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> loadTrees() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final savedTrees = prefs.getStringList('trees') ?? [];
-      final loadedTrees = <Tree>[];
-      final invalidTrees = <String>[];
-      for (final item in savedTrees) {
-        try {
-          loadedTrees.add(Tree.fromJson(jsonDecode(item)));
-        } catch (_) {
-          invalidTrees.add(item);
-        }
-      }
+      final collection = await repository.load();
       if (!mounted) return;
       setState(() {
-        trees = loadedTrees;
+        trees = List.of(collection.trees);
         unreadableTrees
           ..clear()
-          ..addAll(invalidTrees);
+          ..addAll(collection.unreadable);
         treesLoaded = true;
       });
-      if (invalidTrees.isNotEmpty) {
+      unawaited(repository.backend.requestPersistence());
+      if (unreadableTrees.isNotEmpty) {
         showStorageMessage(
-          'Не вдалося прочитати ${invalidTrees.length} записів. Решта дерев завантажена; пошкоджені записи збережено.',
+          'Не вдалося прочитати ${unreadableTrees.length} записів. Решта дерев завантажена; пошкоджені записи збережено.',
         );
       }
-    } catch (_) {
+    } catch (error, trace) {
       if (!mounted) return;
+      debugPrint('Collection load failed: $error\n$trace');
       showStorageMessage(
         'Не вдалося прочитати збережені дерева. Спробуй ще раз.',
         retry: loadTrees,
@@ -225,24 +154,6 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  Future<void> saveTrees(List<Tree> updatedTrees) async {
-    final prefs = await SharedPreferences.getInstance();
-    final data = updatedTrees.map((tree) {
-      return jsonEncode(tree.toJson());
-    }).toList()..addAll(unreadableTrees);
-    try {
-      if (!await prefs.setStringList('trees', data)) {
-        throw StateError('Storage rejected the write');
-      }
-    } catch (_) {
-      // SharedPreferences changes its memory cache before the write completes.
-      try {
-        await prefs.reload();
-      } catch (_) {}
-      rethrow;
-    }
-  }
-
   Future<bool> applyTreeAction(TreeAction action, {Tree? original}) async {
     if (!mounted || !treesLoaded || savingTrees) return false;
     final updatedTrees = List<Tree>.of(trees);
@@ -250,7 +161,7 @@ class _HomePageState extends State<HomePage> {
       if (action.tree == null || action.deleted) return false;
       updatedTrees.add(action.tree!);
     } else {
-      final index = updatedTrees.indexOf(original);
+      final index = updatedTrees.indexWhere((tree) => tree.id == original.id);
       if (index < 0) return false;
       if (action.deleted) {
         updatedTrees.removeAt(index);
@@ -260,12 +171,24 @@ class _HomePageState extends State<HomePage> {
         return false;
       }
     }
+    return persistCollection(updatedTrees, unreadableTrees);
+  }
+
+  Future<bool> persistCollection(
+    List<Tree> updatedTrees,
+    Map<String, String> unreadable,
+  ) async {
+    if (!mounted || !treesLoaded || savingTrees) return false;
+    final preservedUnreadable = Map<String, String>.of(unreadable);
     savingTrees = true;
     try {
-      await saveTrees(updatedTrees);
+      await repository.save(updatedTrees, preservedUnreadable);
       if (mounted) {
         setState(() {
           trees = updatedTrees;
+          unreadableTrees
+            ..clear()
+            ..addAll(preservedUnreadable);
           if (!locations.contains(selectedLocationFilter)) {
             selectedLocationFilter = allFilter;
           }
@@ -275,11 +198,14 @@ class _HomePageState extends State<HomePage> {
         });
       }
       return true;
-    } catch (_) {
+    } catch (error, trace) {
+      debugPrint('Collection save failed: $error\n$trace');
+      if (error is CollectionStorageException &&
+          error.reason == StorageFailure.conflict) {
+        await loadTrees();
+      }
       if (mounted) {
-        showStorageMessage(
-          'Не вдалося зберегти зміни. Можливо, сховище браузера заповнене. Попередні дерева залишилися; спробуй фото меншого розміру або повтори збереження.',
-        );
+        showStorageMessage(storageErrorMessage(error));
       }
       return false;
     } finally {
@@ -419,195 +345,49 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Future<void> openStorage() async {
+    if (!treesLoaded) {
+      showStorageMessage(
+        'Спочатку потрібно завантажити колекцію.',
+        retry: loadTrees,
+      );
+      return;
+    }
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => StorageSettingsPage(
+          repository: repository,
+          collection: () => TreeCollection(trees, unreadableTrees),
+          restore: (backup) {
+            final merged = backup.mergeInto(
+              TreeCollection(trees, unreadableTrees),
+            );
+            return persistCollection(
+              List.of(merged.trees),
+              Map.of(merged.unreadable),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
   // ============================================================
   // HOME CONTENT
   // ============================================================
 
   Widget buildHomeContent() {
-    return Container(
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [Color(0xFF3E8055), Color(0xFF17452F)],
-        ),
-      ),
-      child: Stack(
-        children: [
-          // ======================================================
-          // DECORATIVE LEAVES
-          // ======================================================
-
-          const Positioned(
-            top: 105,
-            left: -18,
-            child: Text('🍃', style: TextStyle(fontSize: 78)),
-          ),
-
-          const Positioned(
-            top: 220,
-            right: -28,
-            child: Text('🌿', style: TextStyle(fontSize: 88)),
-          ),
-
-          const Positioned(
-            bottom: 205,
-            left: -25,
-            child: Text('🌿', style: TextStyle(fontSize: 82)),
-          ),
-
-          const Positioned(
-            bottom: 135,
-            right: -18,
-            child: Text('🍃', style: TextStyle(fontSize: 72)),
-          ),
-
-          // ======================================================
-          // TITLE
-          // ======================================================
-          Positioned(
-            top: 24,
-            left: 0,
-            right: 0,
-            child: SafeArea(
-              bottom: false,
-              child: const Center(
-                child: Text(
-                  '🌿 Derevarium',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 25,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 0.5,
-                  ),
-                ),
-              ),
-            ),
-          ),
-
-          // ======================================================
-          // MAIN BUTTON
-          // ======================================================
-          Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                GestureDetector(
-                  onTap: addTree,
-                  child: Container(
-                    width: 165,
-                    height: 165,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: const Color(0xFF78A878),
-                      border: Border.all(
-                        color: Colors.white.withValues(alpha: 0.9),
-                        width: 4,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.28),
-                          blurRadius: 22,
-                          offset: const Offset(0, 10),
-                        ),
-                      ],
-                    ),
-                    child: Stack(
-                      alignment: Alignment.center,
-                      children: [
-                        const Icon(
-                          Icons.photo_camera_rounded,
-                          size: 62,
-                          color: Colors.white,
-                        ),
-
-                        Positioned(
-                          right: 38,
-                          bottom: 38,
-                          child: Container(
-                            width: 38,
-                            height: 38,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: Colors.white,
-                              boxShadow: [
-                                BoxShadow(
-                                  color: Colors.black.withValues(alpha: 0.2),
-                                  blurRadius: 6,
-                                ),
-                              ],
-                            ),
-                            child: const Icon(
-                              Icons.add,
-                              size: 25,
-                              color: Color(0xFF2F6B45),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-
-                const SizedBox(height: 20),
-
-                const Text(
-                  'Знайти дерево',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 23,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-
-                const SizedBox(height: 7),
-
-                Text(
-                  'Сфотографуйте новий вид',
-                  style: TextStyle(
-                    color: Colors.white.withValues(alpha: 0.72),
-                    fontSize: 14,
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          // ======================================================
-          // COLLECTION COUNTER
-          // ======================================================
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 92,
-            child: Center(
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 20,
-                  vertical: 10,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.10),
-                  borderRadius: BorderRadius.circular(30),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.15),
-                  ),
-                ),
-                child: Text(
-                  trees.isEmpty
-                      ? '🌱 Почніть свою колекцію'
-                      : '🌳 Відкрито видів: $uniqueTypesCount',
-                  style: TextStyle(
-                    color: Colors.white.withValues(alpha: 0.9),
-                    fontSize: 14,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
+    return HomeContent(
+      trees: trees,
+      loaded: treesLoaded,
+      onAdd: addTree,
+      onStorage: openStorage,
+      onStats: openStats,
+      onOpenTree: (tree) {
+        final index = trees.indexWhere((item) => item.id == tree.id);
+        if (index >= 0) openTree(index);
+      },
     );
   }
 
@@ -707,11 +487,11 @@ class TreeCard extends StatelessWidget {
                     : Container(
                         width: 90,
                         height: 90,
-                        color: Colors.green.shade100,
+                        color: AppColors.cardLight,
                         child: const Icon(
                           Icons.park,
                           size: 45,
-                          color: Colors.green,
+                          color: AppColors.sage,
                         ),
                       ),
               ),
@@ -732,13 +512,17 @@ class TreeCard extends StatelessWidget {
                           ),
                         ),
                         if (tree.isRare)
-                          const Icon(Icons.star, color: Colors.amber, size: 20),
+                          const Icon(
+                            Icons.star,
+                            color: AppColors.mint,
+                            size: 20,
+                          ),
                         if (tree.foundTogether)
                           const Padding(
                             padding: EdgeInsets.only(left: 5),
                             child: Icon(
                               Icons.favorite,
-                              color: Colors.pink,
+                              color: AppColors.mint,
                               size: 19,
                             ),
                           ),
@@ -747,7 +531,7 @@ class TreeCard extends StatelessWidget {
                             padding: EdgeInsets.only(left: 5),
                             child: Icon(
                               Icons.sticky_note_2_outlined,
-                              color: Colors.orange,
+                              color: AppColors.sage,
                               size: 19,
                             ),
                           ),
@@ -759,7 +543,7 @@ class TreeCard extends StatelessWidget {
                         const Icon(
                           Icons.location_on_outlined,
                           size: 17,
-                          color: Colors.green,
+                          color: AppColors.sage,
                         ),
                         const SizedBox(width: 4),
                         Expanded(
@@ -909,7 +693,7 @@ class _BestiaryPageState extends State<BestiaryPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          '📖 Бестіарій',
+          'Бестіарій',
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
@@ -932,12 +716,12 @@ class _BestiaryPageState extends State<BestiaryPage> {
                       ),
                       const Text(
                         'видів відкрито',
-                        style: TextStyle(color: Colors.grey),
+                        style: TextStyle(color: AppColors.sage),
                       ),
                     ],
                   ),
                 ),
-                const Icon(Icons.auto_stories, size: 38, color: Colors.green),
+                const Icon(Icons.auto_stories, size: 38, color: AppColors.sage),
               ],
             ),
           ),
@@ -982,7 +766,7 @@ class _BestiaryPageState extends State<BestiaryPage> {
                   },
                 ),
                 _BestiaryFilterChip(
-                  label: '🌳 Знайдені',
+                  label: 'Знайдені',
                   selected: filter == 'Знайдені',
                   onTap: () {
                     setState(() {
@@ -991,7 +775,7 @@ class _BestiaryPageState extends State<BestiaryPage> {
                   },
                 ),
                 _BestiaryFilterChip(
-                  label: '🔒 Незнайдені',
+                  label: 'Незнайдені',
                   selected: filter == 'Незнайдені',
                   onTap: () {
                     setState(() {
@@ -1007,7 +791,7 @@ class _BestiaryPageState extends State<BestiaryPage> {
             child: species.isEmpty
                 ? const Center(
                     child: Text(
-                      'Нічого не знайдено 🔍',
+                      'Нічого не знайдено ',
                       style: TextStyle(fontSize: 18),
                     ),
                   )
@@ -1106,20 +890,18 @@ class _BestiaryTile extends StatelessWidget {
                       fit: BoxFit.cover,
                     )
                   : Container(
-                      color: isFound
-                          ? Colors.green.shade50
-                          : Colors.grey.shade200,
+                      color: isFound ? AppColors.card : AppColors.bgMid,
                       child: Center(
                         child: isFound
                             ? const Icon(
                                 Icons.park,
                                 size: 65,
-                                color: Colors.green,
+                                color: AppColors.sage,
                               )
                             : Icon(
                                 Icons.lock_outline,
                                 size: 52,
-                                color: Colors.grey.shade500,
+                                color: AppColors.sage,
                               ),
                       ),
                     ),
@@ -1142,14 +924,14 @@ class _BestiaryTile extends StatelessWidget {
                   if (isFound)
                     Row(
                       children: [
-                        const Icon(Icons.eco, size: 16, color: Colors.green),
+                        const Icon(Icons.eco, size: 16, color: AppColors.sage),
                         const SizedBox(width: 4),
                         Expanded(
                           child: Text(
                             '${trees.length} ${trees.length == 1 ? 'знахідка' : 'знахідки'}',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(color: Colors.grey),
+                            style: const TextStyle(color: AppColors.sage),
                           ),
                         ),
                       ],
@@ -1157,7 +939,7 @@ class _BestiaryTile extends StatelessWidget {
                   else
                     const Text(
                       'Ще не знайдено',
-                      style: TextStyle(color: Colors.grey),
+                      style: TextStyle(color: AppColors.sage),
                     ),
                 ],
               ),
@@ -1261,11 +1043,11 @@ class BestiarySpeciesPage extends StatelessWidget {
                       Container(
                         width: 110,
                         height: 110,
-                        color: Colors.green.shade100,
+                        color: AppColors.cardLight,
                         child: const Icon(
                           Icons.park,
                           size: 45,
-                          color: Colors.green,
+                          color: AppColors.sage,
                         ),
                       ),
                     Expanded(
@@ -1283,7 +1065,7 @@ class BestiarySpeciesPage extends StatelessWidget {
                             ),
                             const SizedBox(height: 6),
                             Text(
-                              '📍 ${tree.location}',
+                              tree.location,
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
                             ),
@@ -1297,9 +1079,9 @@ class BestiarySpeciesPage extends StatelessWidget {
                               const Padding(
                                 padding: EdgeInsets.only(top: 6),
                                 child: Text(
-                                  '❤️ Знайдено разом',
+                                  'Знайдено разом',
                                   style: TextStyle(
-                                    color: Colors.pink,
+                                    color: AppColors.mint,
                                     fontWeight: FontWeight.w600,
                                   ),
                                 ),
@@ -1458,6 +1240,7 @@ class _AddTreePageState extends State<AddTreePage> {
       source: ImageSource.gallery,
       imageQuality: 75,
       maxWidth: 1000,
+      maxHeight: 1000,
     );
 
     if (image == null) return;
@@ -1465,35 +1248,10 @@ class _AddTreePageState extends State<AddTreePage> {
     final bytes = await image.readAsBytes();
     if (!mounted) return;
 
-    try {
-      final originalImage = img.decodeImage(bytes);
-
-      if (originalImage == null) {
-        setState(() {
-          imageBase64 = base64Encode(bytes);
-        });
-        return;
-      }
-
-      // Додатково зменшуємо фото.
-      final resizedImage = img.copyResize(
-        originalImage,
-        width: originalImage.width > 1000 ? 1000 : originalImage.width,
-      );
-
-      // Зберігаємо як JPEG із якістю 70%.
-      final compressedBytes = img.encodeJpg(resizedImage, quality: 70);
-
-      setState(() {
-        imageBase64 = base64Encode(compressedBytes);
-      });
-    } catch (_) {
-      // Якщо стиснення не вдалося —
-      // зберігаємо оригінальне фото.
-      setState(() {
-        imageBase64 = base64Encode(bytes);
-      });
-    }
+    final compressedBytes = compressTreePhoto(bytes);
+    setState(() {
+      imageBase64 = base64Encode(compressedBytes);
+    });
   }
 
   Future<void> pickDate() async {
@@ -1524,13 +1282,14 @@ class _AddTreePageState extends State<AddTreePage> {
       } else {
         final XFile? image = await picker.pickImage(
           source: ImageSource.gallery,
-          imageQuality: 80,
-          maxWidth: 1200,
+          imageQuality: 75,
+          maxWidth: 1000,
+          maxHeight: 1000,
         );
 
         if (image == null) return;
 
-        bytes = await image.readAsBytes();
+        bytes = compressTreePhoto(await image.readAsBytes());
         if (!mounted) return;
 
         setState(() {
@@ -1552,7 +1311,7 @@ class _AddTreePageState extends State<AddTreePage> {
 
       if (results.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Pl@ntNet не зміг визначити дерево 😕')),
+          const SnackBar(content: Text('Pl@ntNet не зміг визначити дерево ')),
         );
         return;
       }
@@ -1583,14 +1342,14 @@ class _AddTreePageState extends State<AddTreePage> {
 
       loadingFacts = true;
 
-      factsController.text = '🔎 Шукаю цікаві факти про ${result.name}...';
+      factsController.text = 'Шукаю цікаві факти про ${result.name}...';
     });
 
     Navigator.pop(sheetContext);
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('Вибрано: ${result.name} 🌳'),
+        content: Text('Вибрано: ${result.name} '),
         duration: const Duration(seconds: 2),
       ),
     );
@@ -1640,7 +1399,7 @@ class _AddTreePageState extends State<AddTreePage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    '🤖 Результат AI',
+                    'Результат AI',
                     style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
                   ),
 
@@ -1657,8 +1416,8 @@ class _AddTreePageState extends State<AddTreePage> {
                       margin: const EdgeInsets.only(bottom: 10),
                       child: ListTile(
                         leading: CircleAvatar(
-                          backgroundColor: Colors.green.shade100,
-                          child: const Icon(Icons.eco, color: Colors.green),
+                          backgroundColor: AppColors.cardLight,
+                          child: const Icon(Icons.eco, color: AppColors.sage),
                         ),
                         title: Text(
                           result.name,
@@ -1679,8 +1438,8 @@ class _AddTreePageState extends State<AddTreePage> {
                   const SizedBox(height: 8),
 
                   const Text(
-                    '💡 AI може помилятися. Перед збереженням перевір результат.',
-                    style: TextStyle(color: Colors.grey),
+                    'AI може помилятися. Перед збереженням перевір результат.',
+                    style: TextStyle(color: AppColors.sage),
                   ),
                 ],
               ),
@@ -1793,7 +1552,7 @@ class _AddTreePageState extends State<AddTreePage> {
     if (saving || loadingFacts || identifying) return;
     if (selectedTreeType == null || selectedTreeType!.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Вибери або визнач вид дерева 🌳')),
+        const SnackBar(content: Text('Вибери або визнач вид дерева ')),
       );
       return;
     }
@@ -1802,11 +1561,12 @@ class _AddTreePageState extends State<AddTreePage> {
 
     if (location.isEmpty) {
       ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Вкажи локацію 📍')));
+          .showSnackBar(const SnackBar(content: Text('Вкажи локацію ')));
       return;
     }
 
     final tree = Tree(
+      id: widget.tree?.id,
       type: selectedTreeType!,
       location: location,
       locationType: selectedLocationType,
@@ -1900,8 +1660,8 @@ class _AddTreePageState extends State<AddTreePage> {
                     : Container(
                         height: 230,
                         decoration: BoxDecoration(
-                          color: Colors.green.shade50,
-                          border: Border.all(color: Colors.green.shade200),
+                          color: AppColors.card,
+                          border: Border.all(color: AppColors.cardLight),
                           borderRadius: BorderRadius.circular(18),
                         ),
                         child: const Column(
@@ -1910,7 +1670,7 @@ class _AddTreePageState extends State<AddTreePage> {
                             Icon(
                               Icons.add_a_photo_outlined,
                               size: 55,
-                              color: Colors.green,
+                              color: AppColors.sage,
                             ),
                             SizedBox(height: 10),
                             Text(
@@ -1942,7 +1702,7 @@ class _AddTreePageState extends State<AddTreePage> {
                 label: Text(
                   identifying
                       ? 'AI визначає дерево...'
-                      : '🤖 Визначити дерево по фото',
+                      : 'Визначити дерево по фото',
                 ),
               ),
             ),
@@ -1950,6 +1710,7 @@ class _AddTreePageState extends State<AddTreePage> {
             const SizedBox(height: 20),
 
             DropdownButtonFormField<String>(
+              isExpanded: true,
               initialValue: selectedTreeType,
               decoration: InputDecoration(
                 labelText: 'Вид дерева',
@@ -1976,6 +1737,7 @@ class _AddTreePageState extends State<AddTreePage> {
             const SizedBox(height: 16),
 
             DropdownButtonFormField<String>(
+              isExpanded: true,
               initialValue: selectedLocation,
               decoration: InputDecoration(
                 labelText: 'Локація',
@@ -2007,6 +1769,7 @@ class _AddTreePageState extends State<AddTreePage> {
             const SizedBox(height: 16),
 
             DropdownButtonFormField<String>(
+              isExpanded: true,
               initialValue: selectedLocationType,
               decoration: InputDecoration(
                 labelText: 'Тип локації',
@@ -2037,7 +1800,7 @@ class _AddTreePageState extends State<AddTreePage> {
                     foundTogether = value;
                   });
                 },
-                title: const Text('❤️ Знайдено разом'),
+                title: const Text('Знайдено разом'),
                 subtitle: const Text('Ви фотографували дерево разом'),
               ),
             ),
@@ -2052,7 +1815,7 @@ class _AddTreePageState extends State<AddTreePage> {
                     isRare = value;
                   });
                 },
-                title: const Text('⭐ Рідкісний вид'),
+                title: const Text('Рідкісний вид'),
                 subtitle: const Text('Поки що можна позначати вручну'),
               ),
             ),
@@ -2084,7 +1847,7 @@ class _AddTreePageState extends State<AddTreePage> {
               controller: factsController,
               maxLines: 6,
               decoration: InputDecoration(
-                labelText: '📚 Цікаві факти',
+                labelText: 'Цікаві факти',
                 hintText: 'Після визначення дерева факти з’являться тут автоматично...',
                 prefixIcon: const Icon(Icons.menu_book_outlined),
                 suffixIcon: loadingFacts
@@ -2103,9 +1866,9 @@ class _AddTreePageState extends State<AddTreePage> {
               const Padding(
                 padding: EdgeInsets.only(top: 8),
                 child: Text(
-                  '🤖 Шукаємо інформацію про цей вид...',
+                  'Шукаємо інформацію про цей вид...',
                   style: TextStyle(
-                    color: Colors.green,
+                    color: AppColors.sage,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
@@ -2117,8 +1880,8 @@ class _AddTreePageState extends State<AddTreePage> {
               controller: notesController,
               maxLines: 5,
               decoration: InputDecoration(
-                labelText: '❤️ Наша історія',
-                hintText: 'Наприклад: Знайшли, гуляючи після роботи. Маша першою його помітила 😄',
+                labelText: 'Наша історія',
+                hintText: 'Наприклад: Знайшли, гуляючи після роботи. Маша першою його помітила ',
                 prefixIcon: const Icon(Icons.favorite_border),
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(14),
@@ -2183,6 +1946,7 @@ class TreeDetailsPage extends StatelessWidget {
         title: const Text('Дерево'),
         actions: [
           IconButton(
+            tooltip: 'Редагувати дерево',
             icon: const Icon(Icons.edit),
             onPressed: () => editTree(context),
           ),
@@ -2192,20 +1956,29 @@ class TreeDetailsPage extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            if (tree.imageBase64 != null)
-              Image.memory(
-                base64Decode(tree.imageBase64!),
-                width: double.infinity,
-                height: 300,
-                fit: BoxFit.cover,
-              )
-            else
-              Container(
-                width: double.infinity,
-                height: 300,
-                color: Colors.green.shade100,
-                child: const Icon(Icons.park, size: 100, color: Colors.green),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(20),
+                child: tree.imageBase64 != null
+                    ? Image.memory(
+                        base64Decode(tree.imageBase64!),
+                        width: double.infinity,
+                        height: 300,
+                        fit: BoxFit.cover,
+                      )
+                    : Container(
+                        width: double.infinity,
+                        height: 300,
+                        color: AppColors.card,
+                        child: const Icon(
+                          Icons.park_outlined,
+                          size: 100,
+                          color: AppColors.sage,
+                        ),
+                      ),
               ),
+            ),
 
             Padding(
               padding: const EdgeInsets.all(20),
@@ -2224,7 +1997,7 @@ class TreeDetailsPage extends StatelessWidget {
                         ),
                       ),
                       if (tree.isRare)
-                        const Icon(Icons.star, color: Colors.amber, size: 30),
+                        const Icon(Icons.star, color: AppColors.mint, size: 30),
                     ],
                   ),
 
@@ -2232,7 +2005,7 @@ class TreeDetailsPage extends StatelessWidget {
 
                   Row(
                     children: [
-                      const Icon(Icons.location_on, color: Colors.green),
+                      const Icon(Icons.location_on, color: AppColors.sage),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
@@ -2247,14 +2020,14 @@ class TreeDetailsPage extends StatelessWidget {
 
                   Text(
                     'Тип локації: ${tree.locationType}',
-                    style: const TextStyle(color: Colors.grey),
+                    style: const TextStyle(color: AppColors.sage),
                   ),
 
                   const SizedBox(height: 12),
 
                   Row(
                     children: [
-                      const Icon(Icons.calendar_month, color: Colors.green),
+                      const Icon(Icons.calendar_month, color: AppColors.sage),
                       const SizedBox(width: 8),
                       Text(
                         '${tree.dateFound.day.toString().padLeft(2, '0')}.'
@@ -2270,14 +2043,14 @@ class TreeDetailsPage extends StatelessWidget {
                       padding: EdgeInsets.only(top: 12),
                       child: Chip(
                         avatar: Icon(Icons.favorite, size: 17),
-                        label: Text('Знайдено разом ❤️'),
+                        label: Text('Знайдено разом'),
                       ),
                     ),
 
                   const SizedBox(height: 25),
 
                   const Text(
-                    '📚 Цікаві факти',
+                    'Цікаві факти',
                     style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
                   ),
 
@@ -2287,7 +2060,7 @@ class TreeDetailsPage extends StatelessWidget {
                     width: double.infinity,
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      color: Colors.green.shade50,
+                      color: AppColors.card,
                       borderRadius: BorderRadius.circular(16),
                     ),
                     child: Text(
@@ -2300,7 +2073,7 @@ class TreeDetailsPage extends StatelessWidget {
                     const SizedBox(height: 28),
 
                     const Text(
-                      '❤️ Наша історія',
+                      'Наша історія',
                       style: TextStyle(
                         fontSize: 21,
                         fontWeight: FontWeight.bold,
@@ -2313,7 +2086,7 @@ class TreeDetailsPage extends StatelessWidget {
                       width: double.infinity,
                       padding: const EdgeInsets.all(16),
                       decoration: BoxDecoration(
-                        color: Colors.pink.shade50,
+                        color: AppColors.card,
                         borderRadius: BorderRadius.circular(16),
                       ),
                       child: Text(
@@ -2696,7 +2469,7 @@ class _MapPageState extends State<MapPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          '🗺️ Карта відкриттів',
+          'Карта знахідок',
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
@@ -2764,7 +2537,7 @@ class _MapPageState extends State<MapPage> {
                                             CrossAxisAlignment.start,
                                         children: [
                                           Text(
-                                            '📍 $location',
+                                            location,
                                             style: const TextStyle(
                                               fontSize: 22,
                                               fontWeight: FontWeight.bold,
@@ -2792,7 +2565,7 @@ class _MapPageState extends State<MapPage> {
                                                   const Icon(
                                                     Icons.eco,
                                                     size: 18,
-                                                    color: Colors.green,
+                                                    color: AppColors.sage,
                                                   ),
 
                                                   const SizedBox(width: 8),
@@ -2825,11 +2598,11 @@ class _MapPageState extends State<MapPage> {
                                   height: 54,
 
                                   decoration: BoxDecoration(
-                                    color: Colors.green,
+                                    color: AppColors.sage,
                                     shape: BoxShape.circle,
 
                                     border: Border.all(
-                                      color: Colors.white,
+                                      color: AppColors.mint,
                                       width: 4,
                                     ),
 
@@ -2840,7 +2613,7 @@ class _MapPageState extends State<MapPage> {
 
                                   child: const Icon(
                                     Icons.park,
-                                    color: Colors.white,
+                                    color: AppColors.bgDark,
                                     size: 28,
                                   ),
                                 ),
@@ -2852,7 +2625,7 @@ class _MapPageState extends State<MapPage> {
                                   ),
 
                                   decoration: BoxDecoration(
-                                    color: Colors.white,
+                                    color: AppColors.card,
                                     borderRadius: BorderRadius.circular(10),
                                   ),
 
@@ -2909,7 +2682,7 @@ class _MapPageState extends State<MapPage> {
                         children: [
                           const Icon(
                             Icons.forest_outlined,
-                            color: Colors.green,
+                            color: AppColors.sage,
                           ),
 
                           const SizedBox(width: 10),
@@ -3018,7 +2791,7 @@ class StatsPage extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          '📊 Статистика',
+          'Статистика',
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
@@ -3033,7 +2806,7 @@ class StatsPage extends StatelessWidget {
                   const Icon(
                     Icons.forest_rounded,
                     size: 55,
-                    color: Colors.green,
+                    color: AppColors.sage,
                   ),
                   const SizedBox(height: 10),
                   Text(
@@ -3079,7 +2852,7 @@ class StatsPage extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    '🌳 Прогрес колекції',
+                    'Прогрес колекції',
                     style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 8),
@@ -3117,7 +2890,7 @@ class StatsPage extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    '🌱 Види у твоїй колекції',
+                    'Види у твоїй колекції',
                     style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 12),
@@ -3132,7 +2905,7 @@ class StatsPage extends StatelessWidget {
                             const Icon(
                               Icons.park_outlined,
                               size: 20,
-                              color: Colors.green,
+                              color: AppColors.sage,
                             ),
                             const SizedBox(width: 8),
                             Expanded(child: Text(entry.key)),
@@ -3178,7 +2951,7 @@ class _StatCard extends StatelessWidget {
         padding: const EdgeInsets.all(18),
         child: Column(
           children: [
-            Icon(icon, size: 32, color: Colors.green),
+            Icon(icon, size: 32, color: AppColors.sage),
             const SizedBox(height: 8),
             Text(
               value,
@@ -3454,7 +3227,7 @@ class AchievementsPage extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          '🏆 Досягнення',
+          'Досягнення',
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
       ),
@@ -3466,7 +3239,11 @@ class AchievementsPage extends StatelessWidget {
               padding: const EdgeInsets.all(20),
               child: Column(
                 children: [
-                  const Icon(Icons.emoji_events, size: 58, color: Colors.amber),
+                  const Icon(
+                    Icons.emoji_events,
+                    size: 58,
+                    color: AppColors.mint,
+                  ),
                   const SizedBox(height: 10),
                   Text(
                     '$unlocked / ${all.length}',
@@ -3520,13 +3297,13 @@ class _AchievementCard extends StatelessWidget {
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 color: achievement.unlocked
-                    ? Colors.amber.withValues(alpha: 0.18)
-                    : Colors.grey.withValues(alpha: 0.15),
+                    ? AppColors.mint.withValues(alpha: 0.18)
+                    : AppColors.sage.withValues(alpha: 0.15),
               ),
               child: Icon(
                 achievement.icon,
                 size: 30,
-                color: achievement.unlocked ? Colors.amber : Colors.grey,
+                color: achievement.unlocked ? AppColors.mint : AppColors.sage,
               ),
             ),
             const SizedBox(width: 14),
@@ -3551,8 +3328,8 @@ class _AchievementCard extends StatelessWidget {
                             : Icons.lock_outline,
                         size: 20,
                         color: achievement.unlocked
-                            ? Colors.green
-                            : Colors.grey,
+                            ? AppColors.sage
+                            : AppColors.sage,
                       ),
                     ],
                   ),
